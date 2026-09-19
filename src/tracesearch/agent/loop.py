@@ -120,7 +120,14 @@ class SearchAgent:
                 return trajectory
 
             if output.action.kind is ActionKind.ANSWER:
-                trajectory.steps.append(Step(step_index=step_index, thought=output.reasoning, action=output.action))
+                trajectory.steps.append(
+                    Step(
+                        step_index=step_index,
+                        thought=output.reasoning,
+                        action=output.action,
+                        metadata=self._policy_output_metadata(output),
+                    )
+                )
                 trajectory.answer = output.action.value
                 trajectory.termination_reason = TerminationReason.ANSWER
                 trajectory.termination = trajectory.termination_reason.value
@@ -154,7 +161,7 @@ class SearchAgent:
                     error=result.error_message if not result.ok else None,
                     tool_result=result,
                     latency_ms=result.latency_ms,
-                    metadata={"tool_name": result.tool_name},
+                    metadata={"tool_name": result.tool_name, **self._policy_output_metadata(output)},
                 )
             )
 
@@ -248,6 +255,17 @@ class SearchAgent:
         if self.max_visits is not None and trajectory.visit_calls >= self.max_visits:
             return True
         return False
+
+    @staticmethod
+    def _policy_output_metadata(output: PolicyOutput) -> dict[str, Any]:
+        metadata = dict(output.metadata)
+        if output.raw_text is not None:
+            metadata["policy_raw_output"] = output.raw_text
+        if output.response_token_ids is not None:
+            metadata["response_token_ids"] = list(output.response_token_ids)
+        if output.response_logprobs is not None:
+            metadata["response_logprobs"] = list(output.response_logprobs)
+        return metadata
 
     def _rollout_id(self, task: Task, sample_index: int) -> str:
         material = f"{task.task_id}|{self.seed if self.seed is not None else 0}|{sample_index}".encode("utf-8")

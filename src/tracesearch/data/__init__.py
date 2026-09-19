@@ -12,6 +12,7 @@ from tracesearch.data.schema import (
     ToolResult,
     Trajectory,
 )
+from tracesearch.data.adapters import DatasetProvenance, NQDataset, NQTaskAdapter
 
 __all__ = [
     "Action",
@@ -24,4 +25,7 @@ __all__ = [
     "ToolErrorType",
     "ToolResult",
     "Trajectory",
+    "DatasetProvenance",
+    "NQDataset",
+    "NQTaskAdapter",
 ]

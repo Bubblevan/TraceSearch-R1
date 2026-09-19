@@ -2,6 +2,7 @@ from tracesearch.environment.bm25 import BM25Index, tokenize
 from tracesearch.environment.corpus import Corpus
 from tracesearch.environment.faults import FaultKind, FaultSchedule, FaultType, FailureInjector
 from tracesearch.environment.local import LocalSearchEnvironment, LocalSearchTool, LocalVisitTool
+from tracesearch.environment.retriever_http import HTTPRetriever
 from tracesearch.environment.tools import SearchTool, StaticSearchTool, StaticVisitTool, VisitTool
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "LocalSearchEnvironment",
     "LocalSearchTool",
     "LocalVisitTool",
+    "HTTPRetriever",
     "SearchTool",
     "StaticSearchTool",
     "StaticVisitTool",

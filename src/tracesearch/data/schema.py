@@ -98,6 +98,7 @@ class Task:
     split: str = "unspecified"
     gold_evidence_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    policy_metadata: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _require_text("task_id", self.task_id)
@@ -116,6 +117,7 @@ class Task:
             "split": self.split,
             "gold_evidence_ids": list(self.gold_evidence_ids),
             "metadata": _jsonable(self.metadata),
+            "policy_metadata": _jsonable(self.policy_metadata) if self.policy_metadata is not None else None,
         }
 
     def policy_view(self) -> "Task":
@@ -125,13 +127,19 @@ class Task:
         evaluator-side Task object but are not passed to a normal policy.
         """
 
+        visible_metadata = (
+            _policy_visible_metadata(self.metadata)
+            if self.policy_metadata is None
+            else _jsonable(self.policy_metadata)
+        )
         return Task(
             task_id=self.task_id,
             question=self.question,
             answers=[],
             split=self.split,
             gold_evidence_ids=[],
-            metadata=_policy_visible_metadata(self.metadata),
+            metadata=visible_metadata,
+            policy_metadata=visible_metadata,
         )
 
     @classmethod
@@ -143,6 +151,11 @@ class Task:
             split=str(data.get("split", "unspecified")),
             gold_evidence_ids=list(data.get("gold_evidence_ids", [])),
             metadata=dict(data.get("metadata", {})),
+            policy_metadata=(
+                dict(data["policy_metadata"])
+                if data.get("policy_metadata") is not None
+                else None
+            ),
         )
 
 

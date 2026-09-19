@@ -1,0 +1,21 @@
+stage: m1-train
+algorithm: GRPO
+group_size: 4
+learning_rate: null
+clip_epsilon: null
+kl_coef: null
+entropy_coef: null
+train_batch_size: null
+rollout_concurrency: null
+max_prompt_length: null
+max_response_length: null
+max_turns: null
+search_budget: null
+visit_budget: null
+temperature: null
+top_p: null
+optimizer: null
+training_steps: null
+backend:
+  rllm_version: null
+  verl_version: null

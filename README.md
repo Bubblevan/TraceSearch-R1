@@ -15,7 +15,8 @@ TraceSearch-R1 是一个用于研究多轮 Web Search Agent 的实验脚手架�
 - 研究代码保持为轻量的 Python 实现，不复制某个训练框架。
 - 搜索和页面访问通过小型工具接口接入，默认使用离线的确定性 fixture，测试不需要账号和网络。
 - 现有指标覆盖答案正确性、引用情况、搜索轮次、工具失败和成本等维度。
-- 当前提交不包含模型训练实现，也不对强化学习效果作出结论。
+- 当前提交不包含已验证的真实模型训练实验，也不对强化学习效果作出结论。
+- M1 已提供 learned-policy、严格文本 action protocol、HTTP retriever、TrainingTrace 和 vanilla GRPO objective 的 Level-A 边界；真实模型 rollout 与 GRPO 更新仍需外部 model gateway、retriever、rLLM/verl 和可记录的实验资源。
 
 ## 目录结构
 
@@ -25,6 +26,7 @@ src/tracesearch/
   environment/    搜索、访问工具协议和离线工具
   rewards/        失败步骤与贡献度分配辅助函数
   evaluation/     轨迹级指标
+  training/       M1 token trace、reward、group rollout 和 GRPO objective
 tests/            离线单元测试
 docs/             设计说明和实验计划
 ```
@@ -47,7 +49,7 @@ pytest
 | 2 | 失败感知的掩码能否减少有害更新？ | Fatal-aware 消融实验 |
 | 3 | 哪些搜索轮次真正影响最终答案？ | 基于贡献度的 GRPO 消融实验 |
 
-阶段 0 只负责把实验边界和记录方式固定下来。阶段 1 及之后的训练工作，需要在同一套数据划分、搜索后端和预算条件下比较，不能把不同条件下的结果直接并列。
+阶段 0 负责固定实验边界和记录方式。阶段 1 的 Level-A 适配层已经加入；真实模型和训练后端接入前，不把代码能力写成实验收益。所有比较仍需使用同一数据划分、搜索后端和预算条件。
 
 ## 复现约定
 

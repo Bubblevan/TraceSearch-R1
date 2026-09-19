@@ -1,0 +1,19 @@
+stage: m1-level-a
+dataset:
+  path: data/m1/dev.jsonl
+  split: dev
+  upstream_dataset: natural_questions_style_fixture
+  upstream_revision: fixture-v1
+retriever:
+  backend: http
+  url: null
+  timeout_seconds: 10
+model:
+  base_url: null
+  checkpoint: null
+  tokenizer: null
+  prompt_template_version: tracesearch-m1-v1
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 256

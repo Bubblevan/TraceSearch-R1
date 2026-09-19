@@ -4,13 +4,13 @@
 >
 > 本文只回答“TraceSearch-R1 当前实际做了什么、为什么这样做、如何证明”。通用的 Search Agent、Agentic RL、credit assignment、系统和多模态知识统一放在 [`bagua.md`](bagua.md)。
 >
-> 状态标签：`[COMMITTED: a835842]` 表示 M0.1 能力已进入提交；`[LOCAL ARTIFACT, CLEAN-RERUN]` 表示本地产物已从 clean checkout 重跑；`[PLANNED]` 表示设计或路线图中的后续能力。
+> 状态标签：`[COMMITTED: a835842]` 表示 M0.1 能力已进入提交；`[M1 LEVEL A]` 表示接口、协议和离线测试边界已实现，但不等于真实模型或训练实验；`[LOCAL ARTIFACT, CLEAN-RERUN]` 表示本地产物已从 clean checkout 重跑；`[PLANNED]` 表示设计或路线图中的后续能力。
 
 ## 先记住的 30 秒版本
 
 TraceSearch-R1 是一个研究多轮 Search Agent 失败传播与 credit assignment 的个人研究/工程项目。当前 M0 不是 RL 训练系统，而是一套可复现的 research substrate：它把 `Task`、policy decision、`search/visit/answer` action、结构化 `ToolResult`、`Step`、`Trajectory`、离线环境、故障注入、指标和 run artifact 分开保存，为后续比较 Search-R1 风格训练、fatal-aware masking 和 contribution-weighted advantage 提供同一实验边界。
 
-当前已经能在小型 synthetic fixture 上运行确定性的 BM25 Search/Visit 环境，保存 manifest、trajectory、metrics 和 summary，并重算答案、证据召回、工具失败与终止指标。当前 smoke run 使用显式命名的 `OracleFixturePolicy`，会读取 evaluation-only gold evidence；因此它只能验证环境与产物链路，不能说明模型学会了搜索，更不能声称 RL、GRPO、CW-GRPO 或多模态能力已经实现。
+当前已经能在小型 synthetic fixture 上运行确定性的 BM25 Search/Visit 环境，保存 manifest、trajectory、metrics 和 summary，并重算答案、证据召回、工具失败与终止指标。M1 又加入了 learned-policy 的文本协议、OpenAI-compatible client、HTTP retriever、token mask、outcome reward、group rollout 和 vanilla GRPO objective 的 Level-A 边界；但当前没有可用文本 checkpoint、rLLM/verl 后端或真实训练结果。`OracleFixturePolicy` 仍只用于 M0 plumbing smoke，不能说明模型学会了搜索。
 
 ## 面试前的事实纪律
 
@@ -21,8 +21,8 @@ TraceSearch-R1 是一个研究多轮 Search Agent 失败传播与 credit assignm
 | 本地 BM25 Search/Visit 环境 | `[COMMITTED: a835842]` | `src/tracesearch/environment/` | 当前默认是 aligned offline fixture，不是 live Web |
 | deterministic fault injection | `[COMMITTED: a835842]` | `environment/faults.py`、`tests/test_faults.py` | 可定点或按 seed 注入 failure，便于做干净消融 |
 | manifest/trajectory/metrics/summary | `[LOCAL ARTIFACT, CLEAN-RERUN]` | `runs/m0-*-final/` | 产物链路已从 clean checkout 重跑；manifest 记录 `git_dirty=false` 与 source-tree hash |
-| learned policy、真实 LLM inference | `[PLANNED]` | README / design | 当前没有模型服务或学习到的搜索策略 |
-| SFT、PPO、GRPO、GSPO、verl/rLLM | `[PLANNED]` | research roadmap | 当前没有训练 objective、optimizer 或 rollout-training integration |
+| learned policy、真实 LLM inference | `[M1 LEVEL A]` / `[PLANNED]` | `src/tracesearch/agent/policy.py`、`agent/llm.py` | 协议和 client 已实现；当前没有可用文本 checkpoint 或真实模型 rollout |
+| vanilla GRPO objective / rLLM boundary | `[M1 LEVEL A]` | `src/tracesearch/training/` | objective、token projection 和 conversion boundary 已有；rLLM/verl 未安装，未声称完成训练 |
 | fatal-aware training mask | `[PLANNED]` | `rewards/credit.py` 只有 failure index/helper | helper 不等于训练 loss 已接入 |
 | contribution judge / CW-GRPO | `[PLANNED]` | `weighted_advantages` 只有占位式映射 | 没有 judge、过程标注或真实消融 |
 | live Web、multimodal search、memory | `[PLANNED]` | design non-goals | 不能写成当前能力 |
@@ -272,7 +272,7 @@ Execution failure 表示工具没有正常产生结果，例如 timeout、except
 
 #### 30 秒回答
 
-当前完成的是 M0 typed trajectory、async loop、本地 Search/Visit、BM25、预算和终止、故障分类与注入、manifest/artifact、离线指标和 synthetic fixture。没有完成 learned policy、LLM serving、SFT/RL、GRPO/PPO、rollout-training engine、contribution judge、真实 benchmark、live Web 或 multimodal tools。
+当前完成的是 M0 typed trajectory、async loop、本地 Search/Visit、BM25、预算和终止、故障分类与注入、manifest/artifact、离线指标和 synthetic fixture，以及 M1 Level-A 的 learned-policy protocol、NQ-style adapter、HTTP retriever、TrainingTrace/mask、outcome reward、group rollout 和 vanilla GRPO objective。没有完成真实 LLM serving、真实 checkpoint rollout、rLLM/verl backend、Level-B/C 实验、contribution judge、真实 benchmark、live Web 或 multimodal tools。
 
 #### 当前边界
 

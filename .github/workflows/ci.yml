@@ -18,3 +18,5 @@ jobs:
         run: pytest -q
       - name: Run M0 CLI smoke
         run: python -m tracesearch.cli.run_m0 --output runs/ci-smoke
+      - name: Run M1 Level-A CLI smoke
+        run: python -m tracesearch.cli.run_m1_eval --help

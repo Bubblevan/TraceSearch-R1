@@ -1,0 +1,11 @@
+stage: m1-eval
+group_size: 1
+top_k: 5
+max_turns: 6
+search_budget: null
+visit_budget: null
+evaluation_split: dev
+headline_metrics:
+  - normalized_exact_match
+  - answer_rate
+  - pass@1
