@@ -1,10 +1,10 @@
 # TraceSearch-R1 项目面试追问
 
-> 事实截面：2026-09-19。当前 Git `HEAD = 7273383aa131ffebb1fe03c579ee65235eb788a7`，但 M0 相关源码、数据、测试和 run artifact 仍包含未提交修改或未跟踪文件。
+> 事实截面：2026-09-19。M0 基线 Git `HEAD = 538c6835653a5af1c7d8565e35bed34c9506c41f`；本次 M0.1 hardening 以该干净提交为基线。
 >
 > 本文只回答“TraceSearch-R1 当前实际做了什么、为什么这样做、如何证明”。通用的 Search Agent、Agentic RL、credit assignment、系统和多模态知识统一放在 [`bagua.md`](bagua.md)。
 >
-> 状态标签：`[WORKTREE IMPLEMENTED]` 表示当前工作区代码可见；`[ARTIFACT VALIDATED]` 表示有本地 run/test artifact，但不自动等于已提交或 benchmark 结论；`[PLANNED]` 表示设计或路线图中的后续能力。
+> 状态标签：`[COMMITTED: 538c683]` 表示 M0 基线能力已进入提交；`[LOCAL ARTIFACT, PRE-CLEAN-RERUN]` 表示本地产物尚未从 clean checkout 重跑；`[PLANNED]` 表示设计或路线图中的后续能力。
 
 ## 先记住的 30 秒版本
 
@@ -16,18 +16,18 @@ TraceSearch-R1 是一个研究多轮 Search Agent 失败传播与 credit assignm
 
 | 能力 | 当前状态 | 证据 | 可以怎么说 |
 | --- | --- | --- | --- |
-| typed Task/Action/ToolResult/Step/Trajectory | `[WORKTREE IMPLEMENTED]` | `src/tracesearch/data/schema.py` | M0 固定了 policy、environment、evaluator 和未来 trainer 的共享数据边界 |
-| async Search/Visit/Answer loop 与预算终止 | `[WORKTREE IMPLEMENTED]` | `src/tracesearch/agent/loop.py` | runtime 能执行 sync/async policy 和 tool，并记录结构化轨迹 |
-| 本地 BM25 Search/Visit 环境 | `[WORKTREE IMPLEMENTED]` | `src/tracesearch/environment/` | 当前默认是 aligned offline fixture，不是 live Web |
-| deterministic fault injection | `[WORKTREE IMPLEMENTED]` | `environment/faults.py`、`tests/test_faults.py` | 可定点或按 seed 注入 failure，便于做干净消融 |
-| manifest/trajectory/metrics/summary | `[ARTIFACT VALIDATED]` | `runs/m0-*-final/` | 产物链路可运行；必须同时说明 worktree dirty 与 Oracle policy |
+| typed Task/Action/ToolResult/Step/Trajectory | `[COMMITTED: 538c683]` | `src/tracesearch/data/schema.py` | M0 固定了 policy、environment、evaluator 和未来 trainer 的共享数据边界 |
+| async Search/Visit/Answer loop 与预算终止 | `[COMMITTED: 538c683]` | `src/tracesearch/agent/loop.py` | runtime 能执行 sync/async policy 和 tool，并记录结构化轨迹 |
+| 本地 BM25 Search/Visit 环境 | `[COMMITTED: 538c683]` | `src/tracesearch/environment/` | 当前默认是 aligned offline fixture，不是 live Web |
+| deterministic fault injection | `[COMMITTED: 538c683]` | `environment/faults.py`、`tests/test_faults.py` | 可定点或按 seed 注入 failure，便于做干净消融 |
+| manifest/trajectory/metrics/summary | `[LOCAL ARTIFACT, PRE-CLEAN-RERUN]` | `runs/m0-*-final/` | 产物链路可运行；clean checkout 重跑后再更新状态 |
 | learned policy、真实 LLM inference | `[PLANNED]` | README / design | 当前没有模型服务或学习到的搜索策略 |
 | SFT、PPO、GRPO、GSPO、verl/rLLM | `[PLANNED]` | research roadmap | 当前没有训练 objective、optimizer 或 rollout-training integration |
 | fatal-aware training mask | `[PLANNED]` | `rewards/credit.py` 只有 failure index/helper | helper 不等于训练 loss 已接入 |
 | contribution judge / CW-GRPO | `[PLANNED]` | `weighted_advantages` 只有占位式映射 | 没有 judge、过程标注或真实消融 |
 | live Web、multimodal search、memory | `[PLANNED]` | design non-goals | 不能写成当前能力 |
 
-特别注意：`runs/*/manifest.json` 中记录了 `7273383...`，但当前 M0 文件没有全部提交。这个 hash 不能单独证明 artifact 可由该 commit 干净复现；对外表述应写“当前工作区 M0 artifact”，直到实现与 artifact 一起提交并从 clean checkout 复跑。
+特别注意：旧的 `runs/*/manifest.json` 曾记录 `7273383...`，不能证明当前 M0 可由该提交干净复现。M0.1 会把 dirty 状态和 source tree hash 写入 manifest，并在 clean checkout 上重新执行测试与 CLI。
 
 ## 第一轮：项目定位与整体架构
 

@@ -13,7 +13,12 @@ from tracesearch.data.io import load_corpus, load_tasks
 from tracesearch.data.schema import Task, Trajectory
 from tracesearch.environment import Corpus, FaultSchedule, FailureInjector, LocalSearchEnvironment, LocalSearchTool, LocalVisitTool
 from tracesearch.experiment.artifacts import write_run_artifacts
-from tracesearch.experiment.manifest import ExperimentManifest, current_git_commit
+from tracesearch.experiment.manifest import (
+    ExperimentManifest,
+    current_git_commit,
+    current_git_dirty,
+    source_tree_hash,
+)
 
 
 def run_experiment(
@@ -28,8 +33,14 @@ def run_experiment(
     failure_injector: FailureInjector | None = None,
     policy_factory: Any = None,
     run_id: str | None = None,
+    rollout_count: int = 1,
+    pass_k: int | None = None,
+    repo_dir: str | Path | None = None,
 ) -> tuple[ExperimentManifest, list[Trajectory]]:
+    if rollout_count < 1:
+        raise ValueError("rollout_count must be positive")
     run_id = run_id or f"m0-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    repository = Path(repo_dir).resolve() if repo_dir else Path(__file__).resolve().parents[3]
     environment = LocalSearchEnvironment(
         corpus,
         top_k=top_k,
@@ -40,15 +51,17 @@ def run_experiment(
 
     async def execute() -> None:
         for task in tasks:
-            policy = policy_factory(task) if policy_factory else OracleFixturePolicy()
-            agent = SearchAgent(
-                policy,
-                LocalSearchTool(environment),
-                LocalVisitTool(environment),
-                max_turns=max_turns,
-                seed=seed,
-            )
-            trajectories.append(await agent.run_async(task))
+            for sample_index in range(rollout_count):
+                policy = policy_factory(task) if policy_factory else OracleFixturePolicy()
+                agent = SearchAgent(
+                    policy,
+                    LocalSearchTool(environment),
+                    LocalVisitTool(environment),
+                    max_turns=max_turns,
+                    seed=seed,
+                    sample_index=sample_index,
+                )
+                trajectories.append(await agent.run_async(task))
 
     asyncio.run(execute())
     fault_config: dict[str, Any] = {}
@@ -67,7 +80,9 @@ def run_experiment(
         run_id=run_id,
         stage="m0",
         seed=seed,
-        git_commit=current_git_commit(str(Path.cwd())),
+        git_commit=current_git_commit(str(repository)),
+        git_dirty=current_git_dirty(str(repository)),
+        source_tree_hash=source_tree_hash(str(repository)),
         dataset={
             "name": "tracesearch-m0-fixture",
             "version": "1.0",
@@ -76,13 +91,21 @@ def run_experiment(
             "corpus_hash": hash_corpus(corpus.documents),
         },
         environment={"backend": "local_bm25", "top_k": top_k, "fault": fault_config},
-        agent={"policy": "OracleFixturePolicy" if policy_factory is None else getattr(policy_factory, "__name__", "custom"), "max_turns": max_turns, "tool_budget": None},
+        agent={"policy": "OracleFixturePolicy" if policy_factory is None else getattr(policy_factory, "__name__", "custom"), "max_turns": max_turns, "tool_budget": None, "rollout_count": rollout_count},
         model=None,
         training=None,
         budget=None,
         cost={"currency": None, "total": 0},
     )
-    write_run_artifacts(output_dir, manifest, tasks, trajectories, top_k=top_k)
+    write_run_artifacts(
+        output_dir,
+        manifest,
+        tasks,
+        trajectories,
+        top_k=top_k,
+        expected_rollouts=rollout_count,
+        pass_k=pass_k,
+    )
     return manifest, trajectories
 
 

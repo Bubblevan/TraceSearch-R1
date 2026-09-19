@@ -1,12 +1,17 @@
-"""Deterministic metrics computed only from tasks and saved trajectories."""
+"""Deterministic single- and multi-rollout metrics.
+
+Missing rollout slots are explicit failures for answer/pass metrics. Tool
+rates only use observed tool calls because a missing trajectory has no tool
+call to classify.
+"""
 
 from __future__ import annotations
 
 import re
 import statistics
 import unicodedata
-from collections import Counter
-from collections.abc import Iterable
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from tracesearch.agent.types import ActionKind, Trajectory
@@ -42,65 +47,127 @@ def trajectory_metrics(trajectory: Trajectory) -> dict[str, float]:
     }
 
 
-def evaluate_metrics(tasks: Iterable[Task], trajectories: Iterable[Trajectory], *, top_k: int = 5) -> dict[str, Any]:
-    """Evaluate a saved run without consulting environment or policy state."""
+def evaluate_metrics(
+    tasks: Iterable[Task],
+    trajectories: Iterable[Trajectory] | Mapping[str, Iterable[Trajectory]],
+    *,
+    top_k: int = 5,
+    expected_rollouts: int | None = None,
+    pass_k: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate task groups without consulting environment or policy state.
+
+    ``trajectories`` may be a flat iterable or a ``task_id -> iterable``
+    mapping. Groups are ordered by ``sample_index`` and then rollout identity.
+    The evaluator pads each task to ``expected_rollouts`` with missing slots;
+    those slots score zero for answer, exact-match, pass, and group reward
+    variance calculations. If omitted, the largest observed group size is used
+    (or one when the input is empty), making a single-rollout run unchanged.
+    """
 
     if top_k < 1:
         raise ValueError("top_k must be positive")
-    task_values = list(tasks)
-    trajectory_values = list(trajectories)
-    by_id = {trajectory.task_id: trajectory for trajectory in trajectory_values if trajectory.task_id}
-    pairs = [(task, by_id.get(task.task_id)) for task in task_values]
-    pairs = [(task, trajectory) for task, trajectory in pairs if trajectory is not None]
-    if not pairs:
-        return _empty_metrics(len(task_values))
+    if expected_rollouts is not None and expected_rollouts < 1:
+        raise ValueError("expected_rollouts must be positive")
+    if pass_k is not None and pass_k < 1:
+        raise ValueError("pass_k must be positive")
 
-    answered = [trajectory.answer is not None and bool(trajectory.answer.strip()) for _, trajectory in pairs]
-    exact = [normalized_exact_match(trajectory.answer, task.answers) for task, trajectory in pairs]
-    tool_turns = [trajectory.tool_turns for _, trajectory in pairs]
-    search_calls = [trajectory.search_calls for _, trajectory in pairs]
-    visit_calls = [trajectory.visit_calls for _, trajectory in pairs]
-    all_tool_steps = [step for _, trajectory in pairs for step in trajectory.steps if step.is_tool_step]
+    task_values = list(tasks)
+    groups = _group_trajectories(trajectories)
+    observed_max = max((len(groups.get(task.task_id, [])) for task in task_values), default=0)
+    rollout_width = expected_rollouts or max(1, observed_max)
+    pass_width = min(pass_k or rollout_width, rollout_width)
+    slots_by_task = {
+        task.task_id: _slots(groups.get(task.task_id, []), rollout_width) for task in task_values
+    }
+    observed_rollouts = sum(len(groups.get(task.task_id, [])) for task in task_values)
+    missing_rollouts = sum(
+        max(0, rollout_width - len(groups.get(task.task_id, []))) for task in task_values
+    )
+    observed_tasks = sum(bool(groups.get(task.task_id)) for task in task_values)
+
+    if not task_values:
+        return _empty_metrics(0, rollout_width)
+
+    rewards: dict[str, list[float]] = {}
+    for task in task_values:
+        rewards[task.task_id] = [
+            float(trajectory is not None and normalized_exact_match(trajectory.answer, task.answers))
+            for trajectory in slots_by_task[task.task_id]
+        ]
+
+    all_slots = [trajectory for task in task_values for trajectory in slots_by_task[task.task_id]]
+    observed_slot_values = [trajectory for trajectory in all_slots if trajectory is not None]
+    all_tool_steps = [
+        step for trajectory in observed_slot_values for step in trajectory.steps if step.is_tool_step
+    ]
     successful = sum(not step.failed for step in all_tool_steps)
     failed = sum(step.failed for step in all_tool_steps)
+    answered = [float(trajectory is not None and bool(trajectory.answer and trajectory.answer.strip())) for trajectory in all_slots]
+    exact = [reward for reward_values in rewards.values() for reward in reward_values]
+    tool_turns = [trajectory.tool_turns if trajectory else 0 for trajectory in all_slots]
+    search_calls = [trajectory.search_calls if trajectory else 0 for trajectory in all_slots]
+    visit_calls = [trajectory.visit_calls if trajectory else 0 for trajectory in all_slots]
+
     search_recalls: list[float] = []
     visited_recalls: list[float] = []
     failure_by_type: Counter[str] = Counter()
     latencies: list[float] = []
     injected_failure_count = 0
-    for task, trajectory in pairs:
+    for task in task_values:
         gold = set(task.gold_evidence_ids)
-        retrieved: set[str] = set()
-        visited: set[str] = set()
-        for step in trajectory.steps:
-            if not step.is_tool_step or step.tool_result is None:
-                continue
-            result = step.tool_result
-            latencies.append(result.latency_ms)
-            if result.metadata.get("injected_fault"):
-                injected_failure_count += 1
-            if not result.ok and result.error_type is not None:
-                failure_by_type[result.error_type.value] += 1
-            if step.action.kind is ActionKind.SEARCH:
-                retrieved.update(item.doc_id for item in result.evidence if item.rank <= top_k)
-            elif step.action.kind is ActionKind.VISIT:
-                visited.update(item.doc_id for item in result.evidence)
-                document = result.metadata.get("document")
-                if isinstance(document, dict) and document.get("doc_id"):
-                    visited.add(str(document["doc_id"]))
-        # No-search calibration tasks are intentionally not applicable to
-        # evidence recall, so they do not dilute retrieval metrics.
-        if gold:
-            search_recalls.append(len(retrieved & gold) / len(gold))
-            visited_recalls.append(len(visited & gold) / len(gold))
+        for trajectory in slots_by_task[task.task_id]:
+            retrieved: set[str] = set()
+            visited: set[str] = set()
+            if trajectory is not None:
+                for step in trajectory.steps:
+                    if not step.is_tool_step or step.tool_result is None:
+                        continue
+                    result = step.tool_result
+                    latencies.append(result.latency_ms)
+                    if result.metadata.get("injected_fault"):
+                        injected_failure_count += 1
+                    if not result.ok and result.error_type is not None:
+                        failure_by_type[result.error_type.value] += 1
+                    if step.action.kind is ActionKind.SEARCH:
+                        retrieved.update(item.doc_id for item in result.evidence if item.rank <= top_k)
+                    elif step.action.kind is ActionKind.VISIT:
+                        visited.update(item.doc_id for item in result.evidence)
+                        document = result.metadata.get("document")
+                        if isinstance(document, dict) and document.get("doc_id"):
+                            visited.add(str(document["doc_id"]))
+            if gold:
+                search_recalls.append(len(retrieved & gold) / len(gold))
+                visited_recalls.append(len(visited & gold) / len(gold))
 
-    termination_histogram = Counter(trajectory.termination_reason.value for _, trajectory in pairs)
+    pass_at_1 = statistics.mean(reward_values[0] for reward_values in rewards.values())
+    pass_at_k = statistics.mean(
+        float(any(reward_values[:pass_width])) for reward_values in rewards.values()
+    )
+    group_variances = [statistics.pvariance(reward_values) for reward_values in rewards.values()]
+    termination_histogram = Counter(
+        trajectory.termination_reason.value
+        for trajectory in observed_slot_values
+    )
+    if missing_rollouts:
+        termination_histogram["missing"] += missing_rollouts
+
     return {
         "task_count": len(task_values),
-        "evaluated_task_count": len(pairs),
+        "evaluated_task_count": observed_tasks,
+        "observed_task_count": observed_tasks,
+        "observed_rollout_count": observed_rollouts,
+        "expected_rollout_count": rollout_width,
+        "missing_task_count": len(task_values) - observed_tasks,
+        "missing_trajectory_count": missing_rollouts,
         "answer_rate": _mean(answered),
         "normalized_exact_match": _mean(exact),
         "exact_match_rate": _mean(exact),
+        "pass@1": pass_at_1,
+        "pass@k": pass_at_k,
+        "pass_at_1": pass_at_1,
+        "pass_at_k": pass_at_k,
+        "group_reward_variance": _mean(group_variances),
         "avg_tool_turns": _mean(tool_turns),
         "avg_search_calls": _mean(search_calls),
         "avg_visit_calls": _mean(visit_calls),
@@ -116,13 +183,48 @@ def evaluate_metrics(tasks: Iterable[Task], trajectories: Iterable[Trajectory], 
     }
 
 
-def _empty_metrics(task_count: int) -> dict[str, Any]:
+def _group_trajectories(
+    trajectories: Iterable[Trajectory] | Mapping[str, Iterable[Trajectory]],
+) -> dict[str, list[Trajectory]]:
+    if isinstance(trajectories, Mapping):
+        grouped: dict[str, list[Trajectory]] = {}
+        for task_id, values in trajectories.items():
+            if isinstance(values, Trajectory):
+                grouped[str(task_id)] = [values]
+            else:
+                grouped[str(task_id)] = list(values)
+    else:
+        grouped = defaultdict(list)
+        for trajectory in trajectories:
+            if trajectory.task_id is not None:
+                grouped[trajectory.task_id].append(trajectory)
+    for task_id in grouped:
+        grouped[task_id].sort(key=lambda item: (item.sample_index, item.rollout_id, item.trajectory_id))
+    return dict(grouped)
+
+
+def _slots(values: list[Trajectory], width: int) -> list[Trajectory | None]:
+    return list(values[:width]) + [None] * max(0, width - len(values))
+
+
+def _empty_metrics(task_count: int, rollout_width: int) -> dict[str, Any]:
+    missing = task_count * rollout_width
     return {
         "task_count": task_count,
         "evaluated_task_count": 0,
+        "observed_task_count": 0,
+        "observed_rollout_count": 0,
+        "expected_rollout_count": rollout_width,
+        "missing_task_count": task_count,
+        "missing_trajectory_count": missing,
         "answer_rate": 0.0,
         "normalized_exact_match": 0.0,
         "exact_match_rate": 0.0,
+        "pass@1": 0.0,
+        "pass@k": 0.0,
+        "pass_at_1": 0.0,
+        "pass_at_k": 0.0,
+        "group_reward_variance": 0.0,
         "avg_tool_turns": 0.0,
         "avg_search_calls": 0.0,
         "avg_visit_calls": 0.0,
@@ -130,7 +232,7 @@ def _empty_metrics(task_count: int) -> dict[str, Any]:
         "tool_failure_rate": 0.0,
         "search_recall_at_k": 0.0,
         "visited_gold_evidence_recall": 0.0,
-        "termination_histogram": {},
+        "termination_histogram": {"missing": missing} if missing else {},
         "injected_failure_count": 0,
         "failure_count_by_type": {},
         "tool_latency_p50_ms": 0.0,

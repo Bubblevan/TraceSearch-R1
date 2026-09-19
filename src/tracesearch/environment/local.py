@@ -27,9 +27,16 @@ class LocalSearchEnvironment:
             raise ValueError("configured_latency_ms must be non-negative")
         self.index = BM25Index(self.corpus.documents)
 
-    async def search(self, query: str, *, step_index: int = 0, task_id: str | None = None) -> ToolResult:
+    async def search(
+        self,
+        query: str,
+        *,
+        step_index: int = 0,
+        task_id: str | None = None,
+        rollout_id: str | None = None,
+    ) -> ToolResult:
         started = time.perf_counter()
-        fault = self._fault("search", step_index, task_id)
+        fault = self._fault("search", step_index, task_id, rollout_id)
         injected = self._injected_result("search", query, fault, started)
         if injected is not None:
             return injected
@@ -62,9 +69,16 @@ class LocalSearchEnvironment:
             started=started,
         )
 
-    async def visit(self, doc_id: str, *, step_index: int = 0, task_id: str | None = None) -> ToolResult:
+    async def visit(
+        self,
+        doc_id: str,
+        *,
+        step_index: int = 0,
+        task_id: str | None = None,
+        rollout_id: str | None = None,
+    ) -> ToolResult:
         started = time.perf_counter()
-        fault = self._fault("visit", step_index, task_id)
+        fault = self._fault("visit", step_index, task_id, rollout_id)
         injected = self._injected_result("visit", doc_id, fault, started)
         if injected is not None:
             return injected
@@ -108,9 +122,24 @@ class LocalSearchEnvironment:
             started=started,
         )
 
-    def _fault(self, tool_name: str, step_index: int, task_id: str | None) -> FaultType | None:
+    def _fault(
+        self,
+        tool_name: str,
+        step_index: int,
+        task_id: str | None,
+        rollout_id: str | None,
+    ) -> FaultType | None:
         scheduled = self.fault_schedule.get_fault(step_index=step_index, tool_name=tool_name, task_id=task_id) if self.fault_schedule else None
-        return scheduled or (self.failure_injector.next_fault(tool_name, step_index) if self.failure_injector else None)
+        return scheduled or (
+            self.failure_injector.next_fault(
+                tool_name,
+                step_index,
+                task_id=task_id or "",
+                rollout_id=rollout_id or "",
+            )
+            if self.failure_injector
+            else None
+        )
 
     def _injected_result(self, tool_name: str, request: Any, fault: FaultType | None, started: float) -> ToolResult | None:
         if fault is None:

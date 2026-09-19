@@ -25,6 +25,22 @@ from tracesearch.environment.render import render_tool_result
 Policy = Callable[[str, list[Step]], tuple[str, Action]]
 
 
+def exception_to_tool_error_type(exc: BaseException) -> ToolErrorType:
+    """Classify adapter exceptions without collapsing known failures to INTERNAL."""
+
+    if isinstance(exc, TimeoutError):
+        return ToolErrorType.TIMEOUT
+    if isinstance(exc, (FileNotFoundError, KeyError, LookupError)):
+        return ToolErrorType.NOT_FOUND
+    if isinstance(exc, (ConnectionError, OSError)):
+        return ToolErrorType.TRANSIENT
+    if isinstance(exc, ValueError):
+        return ToolErrorType.INVALID_ARGUMENT
+    if isinstance(exc, TypeError):
+        return ToolErrorType.MALFORMED_RESULT
+    return ToolErrorType.INTERNAL
+
+
 class SearchAgent:
     """Execute search/visit/answer policies against sync or async tools."""
 
@@ -39,12 +55,16 @@ class SearchAgent:
         max_visits: int | None = None,
         tool_budget: int | None = None,
         seed: int | None = None,
+        rollout_id: str | None = None,
+        sample_index: int = 0,
     ):
         if max_turns < 1:
             raise ValueError("max_turns must be positive")
         for name, value in (("max_searches", max_searches), ("max_visits", max_visits), ("tool_budget", tool_budget)):
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if sample_index < 0:
+            raise ValueError("sample_index must be non-negative")
         self.policy = policy
         self.search = search
         self.visit = visit
@@ -53,17 +73,30 @@ class SearchAgent:
         self.max_visits = max_visits
         self.tool_budget = tool_budget
         self.seed = seed
+        self.rollout_id = rollout_id
+        self.sample_index = sample_index
 
-    async def run_async(self, task: Task) -> Trajectory:
+    async def run_async(
+        self,
+        task: Task,
+        *,
+        rollout_id: str | None = None,
+        sample_index: int | None = None,
+    ) -> Trajectory:
         """Run one task and return the canonical structured trajectory."""
 
         if not isinstance(task, Task):
             raise TypeError("run_async expects a Task")
+        resolved_sample_index = self.sample_index if sample_index is None else sample_index
+        if resolved_sample_index < 0:
+            raise ValueError("sample_index must be non-negative")
+        resolved_rollout_id = rollout_id or self.rollout_id or self._rollout_id(task, resolved_sample_index)
         trajectory = Trajectory(
             question=task.question,
             task_id=task.task_id,
             seed=self.seed,
-            trajectory_id=self._trajectory_id(task),
+            rollout_id=resolved_rollout_id,
+            sample_index=resolved_sample_index,
         )
         for step_index in range(self.max_turns):
             if self._budget_exhausted(trajectory):
@@ -94,15 +127,23 @@ class SearchAgent:
                 return trajectory
 
             try:
-                result = await self._execute_result(output.action, step_index=step_index, task_id=task.task_id)
-            except (TimeoutError, ValueError, KeyError, ConnectionError) as exc:
+                result = await self._execute_result(
+                    output.action,
+                    step_index=step_index,
+                    task_id=task.task_id,
+                    rollout_id=trajectory.rollout_id,
+                )
+            except Exception as exc:
                 result = ToolResult(
                     tool_name=output.action.kind.value,
                     ok=False,
                     request=output.action.value,
-                    error_type=ToolErrorType.INTERNAL,
+                    error_type=exception_to_tool_error_type(exc),
                     error_message=f"{type(exc).__name__}: {exc}",
-                    metadata={"failure_class": "environment_error"},
+                    metadata={
+                        "failure_class": "environment_error",
+                        "exception_class": type(exc).__name__,
+                    },
                 )
             trajectory.steps.append(
                 Step(
@@ -152,11 +193,18 @@ class SearchAgent:
             return PolicyOutput(str(thought), action)
         raise TypeError("policy must return PolicyOutput, Action, or (reasoning, Action)")
 
-    async def _execute_result(self, action: Action, *, step_index: int, task_id: str) -> ToolResult:
+    async def _execute_result(
+        self,
+        action: Action,
+        *,
+        step_index: int,
+        task_id: str,
+        rollout_id: str,
+    ) -> ToolResult:
         if action.kind is ActionKind.SEARCH:
-            raw = await self._call_tool(self.search, "search", action.value, step_index, task_id)
+            raw = await self._call_tool(self.search, "search", action.value, step_index, task_id, rollout_id)
         elif action.kind is ActionKind.VISIT:
-            raw = await self._call_tool(self.visit, "visit", action.value, step_index, task_id)
+            raw = await self._call_tool(self.visit, "visit", action.value, step_index, task_id, rollout_id)
         else:
             raise ValueError(f"unsupported tool action: {action.kind}")
         if isinstance(raw, ToolResult):
@@ -167,7 +215,15 @@ class SearchAgent:
             return ToolResult.from_dict(raw)
         raise TypeError(f"tool returned unsupported result type: {type(raw).__name__}")
 
-    async def _call_tool(self, tool: Any, method_name: str, value: str, step_index: int, task_id: str) -> Any:
+    async def _call_tool(
+        self,
+        tool: Any,
+        method_name: str,
+        value: str,
+        step_index: int,
+        task_id: str,
+        rollout_id: str,
+    ) -> Any:
         method = getattr(tool, method_name)
         kwargs: dict[str, object] = {}
         try:
@@ -177,6 +233,8 @@ class SearchAgent:
                 kwargs["step_index"] = step_index
             if "task_id" in parameters or accepts_context:
                 kwargs["task_id"] = task_id
+            if "rollout_id" in parameters or accepts_context:
+                kwargs["rollout_id"] = rollout_id
         except (TypeError, ValueError):
             parameters = {}
         raw = method(value, **kwargs)
@@ -191,15 +249,26 @@ class SearchAgent:
             return True
         return False
 
-    def _trajectory_id(self, task: Task) -> str:
-        material = f"{task.task_id}|{self.seed if self.seed is not None else 0}".encode("utf-8")
+    def _rollout_id(self, task: Task, sample_index: int) -> str:
+        material = f"{task.task_id}|{self.seed if self.seed is not None else 0}|{sample_index}".encode("utf-8")
+        return "rollout-" + hashlib.sha256(material).hexdigest()[:24]
+
+    def _trajectory_id(self, task: Task, sample_index: int | None = None) -> str:
+        index = self.sample_index if sample_index is None else sample_index
+        rollout_id = self.rollout_id or self._rollout_id(task, index)
+        material = f"{rollout_id}|{task.question}".encode("utf-8")
         return "traj-" + hashlib.sha256(material).hexdigest()[:24]
 
     def _execute(self, action: Action) -> str:
         """Legacy helper retained for callers of the original scaffold."""
 
         async def execute() -> ToolResult:
-            return await self._execute_result(action, step_index=0, task_id="compat")
+            return await self._execute_result(
+                action,
+                step_index=0,
+                task_id="compat",
+                rollout_id="compat",
+            )
 
         result = asyncio.run(execute())
         return render_tool_result(result)

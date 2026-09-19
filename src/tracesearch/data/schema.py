@@ -8,11 +8,11 @@ training integrations.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
-import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any
 
 
 SCHEMA_VERSION = "m0.v1"
@@ -67,6 +67,29 @@ def _require_text(name: str, value: str, *, allow_empty: bool = False) -> None:
         raise ValueError(f"{name} must be a non-empty string")
 
 
+def _policy_visible_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep task context while removing evaluation-only metadata namespaces."""
+
+    visible: dict[str, Any] = {}
+    for key, value in metadata.items():
+        normalized = str(key).casefold()
+        if (
+            normalized in {"answers", "gold_evidence_ids", "hop_count", "no_search", "oracle", "label", "reference"}
+            or normalized.startswith(("eval", "gold", "answer", "label", "reference"))
+            or "evaluation" in normalized
+        ):
+            continue
+        if isinstance(value, dict):
+            visible[str(key)] = _policy_visible_metadata(value)
+        elif isinstance(value, list):
+            visible[str(key)] = [
+                _policy_visible_metadata(item) if isinstance(item, dict) else item for item in value
+            ]
+        else:
+            visible[str(key)] = value
+    return visible
+
+
 @dataclass(frozen=True)
 class Task:
     task_id: str
@@ -96,7 +119,11 @@ class Task:
         }
 
     def policy_view(self) -> "Task":
-        """Return the task surface exposed to ordinary policies."""
+        """Return the task surface exposed to ordinary policies.
+
+        Answer aliases, gold IDs, and evaluation-only metadata are kept on the
+        evaluator-side Task object but are not passed to a normal policy.
+        """
 
         return Task(
             task_id=self.task_id,
@@ -104,7 +131,7 @@ class Task:
             answers=[],
             split=self.split,
             gold_evidence_ids=[],
-            metadata=dict(self.metadata),
+            metadata=_policy_visible_metadata(self.metadata),
         )
 
     @classmethod
@@ -359,14 +386,18 @@ class Trajectory:
     answer: str | None = None
     termination: str = TerminationReason.MAX_TURNS.value
     schema_version: str = SCHEMA_VERSION
-    trajectory_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    trajectory_id: str | None = None
     task_id: str | None = None
     termination_reason: TerminationReason | None = None
     seed: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    rollout_id: str | None = None
+    sample_index: int = 0
 
     def __post_init__(self) -> None:
         _require_text("question", self.question)
+        if self.sample_index < 0:
+            raise ValueError("sample_index must be non-negative")
         if self.termination_reason is None:
             self.termination_reason = TerminationReason(self.termination)
         else:
@@ -374,6 +405,14 @@ class Trajectory:
         self.termination = self.termination_reason.value
         if not all(isinstance(step, Step) for step in self.steps):
             self.steps = [Step.from_dict(step) if isinstance(step, dict) else step for step in self.steps]
+        identity = f"{self.task_id or 'anonymous'}|{self.seed if self.seed is not None else 0}|{self.sample_index}"
+        if self.rollout_id is None:
+            self.rollout_id = "rollout-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        _require_text("rollout_id", self.rollout_id)
+        if self.trajectory_id is None:
+            trajectory_identity = f"{self.rollout_id}|{self.question}"
+            self.trajectory_id = "traj-" + hashlib.sha256(trajectory_identity.encode("utf-8")).hexdigest()[:24]
+        _require_text("trajectory_id", self.trajectory_id)
 
     @property
     def tool_turns(self) -> int:
@@ -399,6 +438,8 @@ class Trajectory:
         return {
             "schema_version": self.schema_version,
             "trajectory_id": self.trajectory_id,
+            "rollout_id": self.rollout_id,
+            "sample_index": self.sample_index,
             "task_id": self.task_id,
             "question": self.question,
             "steps": [step.to_dict() for step in self.steps],
@@ -418,11 +459,13 @@ class Trajectory:
             answer=data.get("answer"),
             termination=str(reason),
             schema_version=str(data.get("schema_version", SCHEMA_VERSION)),
-            trajectory_id=str(data.get("trajectory_id", uuid.uuid4())),
+            trajectory_id=data.get("trajectory_id"),
             task_id=data.get("task_id"),
             termination_reason=TerminationReason(reason),
             seed=data.get("seed"),
             metadata=dict(data.get("metadata", {})),
+            rollout_id=data.get("rollout_id"),
+            sample_index=int(data.get("sample_index", 0)),
         )
 
     def to_json(self) -> str:

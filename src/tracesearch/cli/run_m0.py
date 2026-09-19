@@ -16,6 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--max-turns", type=int, default=8)
+    parser.add_argument("--rollouts", type=int, default=1)
+    parser.add_argument("--pass-k", type=int, default=None)
     parser.add_argument("--output", type=Path, default=Path("runs/m0-smoke"))
     parser.add_argument("--fault-profile", choices=("none", "reproducible"), default="none")
     return parser
@@ -35,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         top_k=args.top_k,
         max_turns=args.max_turns,
+        rollout_count=args.rollouts,
+        pass_k=args.pass_k,
         fault_schedule=schedule,
         failure_injector=injector,
     )
@@ -47,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
         f"tasks={metrics['task_count']} "
         f"answer_rate={metrics['answer_rate']:.3f} "
         f"exact_match={metrics['normalized_exact_match']:.3f} "
+        f"pass@k={metrics['pass@k']:.3f} "
+        f"missing={metrics['missing_trajectory_count']} "
         f"tool_failure_rate={metrics['tool_failure_rate']:.3f}"
     )
     return 0

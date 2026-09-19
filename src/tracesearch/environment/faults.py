@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import random
+import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
@@ -82,8 +82,6 @@ class FailureInjector:
     empty_result_rate: float = 0.0
     malformed_result_rate: float = 0.0
     irrelevant_result_rate: float = 0.0
-    _rng: random.Random = field(init=False, repr=False)
-
     def __post_init__(self) -> None:
         rates = (
             self.timeout_rate,
@@ -94,21 +92,53 @@ class FailureInjector:
         )
         if any(rate < 0 or rate > 1 for rate in rates):
             raise ValueError("fault rates must be between 0 and 1")
-        self._rng = random.Random(self.seed)
 
-    def next_fault(self, tool_name: str = "", step_index: int | None = None) -> FaultType | None:
-        # Fixed draw order is part of the reproducibility contract.
-        if self._rng.random() < self.timeout_rate:
-            return FaultType.TIMEOUT
-        if self._rng.random() < self.exception_rate:
-            return FaultType.EXCEPTION
-        if self._rng.random() < self.empty_result_rate:
-            return FaultType.EMPTY_RESULT
-        if self._rng.random() < self.malformed_result_rate:
-            return FaultType.MALFORMED_RESULT
-        if self._rng.random() < self.irrelevant_result_rate:
-            return FaultType.IRRELEVANT_RESULT
+    def next_fault(
+        self,
+        tool_name: str = "",
+        step_index: int | None = None,
+        *,
+        task_id: str = "",
+        rollout_id: str = "",
+    ) -> FaultType | None:
+        """Return a keyed decision with no mutable RNG state.
+
+        The key includes every part of the failure surface that must remain
+        stable when rollouts are reordered or executed concurrently.
+        """
+
+        step = 0 if step_index is None else step_index
+        rates = (
+            (self.timeout_rate, FaultType.TIMEOUT),
+            (self.exception_rate, FaultType.EXCEPTION),
+            (self.empty_result_rate, FaultType.EMPTY_RESULT),
+            (self.malformed_result_rate, FaultType.MALFORMED_RESULT),
+            (self.irrelevant_result_rate, FaultType.IRRELEVANT_RESULT),
+        )
+        for draw_index, (rate, fault) in enumerate(rates):
+            value = self._uniform(task_id, rollout_id, step, tool_name, draw_index)
+            if value < rate:
+                return fault
         return None
 
-    def decide(self, tool_name: str = "", step_index: int | None = None) -> FaultType | None:
-        return self.next_fault(tool_name, step_index)
+    def decide(
+        self,
+        tool_name: str = "",
+        step_index: int | None = None,
+        *,
+        task_id: str = "",
+        rollout_id: str = "",
+    ) -> FaultType | None:
+        return self.next_fault(
+            tool_name,
+            step_index,
+            task_id=task_id,
+            rollout_id=rollout_id,
+        )
+
+    def _uniform(self, task_id: str, rollout_id: str, step_index: int, tool_name: str, draw_index: int) -> float:
+        material = "|".join(
+            (str(self.seed), task_id, rollout_id, str(step_index), tool_name, str(draw_index))
+        ).encode("utf-8")
+        digest = hashlib.blake2b(material, digest_size=8).digest()
+        return int.from_bytes(digest, "big") / 2**64

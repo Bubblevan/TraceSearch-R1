@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from tracesearch.data.schema import SCHEMA_VERSION
@@ -27,6 +29,8 @@ class ExperimentManifest:
     stage: str = "m0"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     git_commit: str | None = None
+    git_dirty: bool | None = None
+    source_tree_hash: str | None = None
     seed: int = 0
     dataset: Section | dict[str, Any] = field(default_factory=Section)
     environment: Section | dict[str, Any] = field(default_factory=Section)
@@ -54,6 +58,8 @@ class ExperimentManifest:
             "stage": self.stage,
             "created_at": self.created_at,
             "git_commit": self.git_commit,
+            "git_dirty": self.git_dirty,
+            "source_tree_hash": self.source_tree_hash,
             "seed": self.seed,
             "dataset": dict(self.dataset),
             "environment": dict(self.environment),
@@ -82,3 +88,48 @@ def current_git_commit(repo_dir: str | None = None) -> str | None:
         return None
     value = completed.stdout.strip()
     return value or None
+
+
+def current_git_dirty(repo_dir: str | None = None) -> bool | None:
+    """Return whether tracked or non-ignored untracked files are present."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(completed.stdout.strip())
+
+
+def source_tree_hash(repo_dir: str | None = None) -> str | None:
+    """Hash tracked plus non-ignored untracked files with their relative paths."""
+
+    root = Path(repo_dir or Path.cwd()).resolve()
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    digest = hashlib.sha256()
+    paths = sorted(path for path in completed.stdout.splitlines() if path)
+    for relative in paths:
+        path = root / relative
+        if not path.is_file():
+            continue
+        digest.update(relative.replace("\\", "/").encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\n")
+    return digest.hexdigest()
