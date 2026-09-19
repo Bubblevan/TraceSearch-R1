@@ -57,7 +57,7 @@ def _summary(manifest: ExperimentManifest, metrics: dict[str, object], destinati
             f"- Normalized exact match: {metrics['normalized_exact_match']:.3f}",
             f"- Pass@1 / pass@k: {metrics['pass@1']:.3f} / {metrics['pass@k']:.3f}",
             f"- Missing trajectory slots: {metrics['missing_trajectory_count']}",
-            f"- Group reward variance: {metrics['group_reward_variance']:.3f}",
+            f"- Group exact-match variance: {metrics['group_exact_match_variance']:.3f}",
             f"- Search recall@k: {metrics['search_recall_at_k']:.3f}",
             f"- Visited gold evidence recall: {metrics['visited_gold_evidence_recall']:.3f}",
             f"- Average tool turns: {metrics['avg_tool_turns']:.3f}",

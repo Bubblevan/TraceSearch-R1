@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from tracesearch.agent import Action, ActionKind, SearchAgent, Task, ToolErrorType, Trajectory
 from tracesearch.data.schema import Step
 from tracesearch.environment import FailureInjector, StaticVisitTool
@@ -62,8 +64,52 @@ def test_evaluator_pads_missing_rollouts_and_reports_group_metrics():
     assert metrics["missing_trajectory_count"] == 3
     assert metrics["pass@1"] == 0.5
     assert metrics["pass@k"] == 0.5
-    assert metrics["group_reward_variance"] == 0.125
+    assert metrics["group_exact_match_variance"] == 0.125
     assert metrics["termination_histogram"]["missing"] == 3
+
+
+def test_evaluator_preserves_sparse_sample_index_slots():
+    task = Task("task", "Question", ["yes"], "test")
+    trajectory = Trajectory(
+        question="Question",
+        task_id="task",
+        rollout_id="task-1",
+        sample_index=1,
+        answer="yes",
+        steps=[Step("answer", Action(ActionKind.ANSWER, "yes"))],
+        termination="answer",
+    )
+
+    metrics = evaluate_metrics([task], {"task": [trajectory]}, expected_rollouts=2)
+
+    assert metrics["pass@1"] == 0.0
+    assert metrics["pass@k"] == 1.0
+    assert metrics["missing_trajectory_count"] == 1
+
+
+def test_evaluator_rejects_duplicate_and_out_of_range_sample_indices():
+    task = Task("task", "Question", ["yes"], "test")
+
+    def trajectory(sample_index: int, rollout_id: str) -> Trajectory:
+        return Trajectory(
+            question="Question",
+            task_id="task",
+            rollout_id=rollout_id,
+            sample_index=sample_index,
+            answer="yes",
+            steps=[Step("answer", Action(ActionKind.ANSWER, "yes"))],
+            termination="answer",
+        )
+
+    with pytest.raises(ValueError, match="duplicate sample_index"):
+        evaluate_metrics(
+            [task],
+            {"task": [trajectory(0, "task-0"), trajectory(0, "task-0b")]},
+            expected_rollouts=2,
+        )
+
+    with pytest.raises(ValueError, match="outside rollout width"):
+        evaluate_metrics([task], {"task": [trajectory(2, "task-2")]}, expected_rollouts=2)
 
 
 def test_exception_mapping_records_specific_tool_error_type():

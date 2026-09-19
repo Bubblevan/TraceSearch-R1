@@ -60,9 +60,9 @@ def evaluate_metrics(
     ``trajectories`` may be a flat iterable or a ``task_id -> iterable``
     mapping. Groups are ordered by ``sample_index`` and then rollout identity.
     The evaluator pads each task to ``expected_rollouts`` with missing slots;
-    those slots score zero for answer, exact-match, pass, and group reward
-    variance calculations. If omitted, the largest observed group size is used
-    (or one when the input is empty), making a single-rollout run unchanged.
+    those slots score zero for answer, exact-match, pass, and exact-match
+    variance calculations. If omitted, the largest observed sample index plus
+    one is used (or one when the input is empty), preserving sparse slots.
     """
 
     if top_k < 1:
@@ -74,8 +74,15 @@ def evaluate_metrics(
 
     task_values = list(tasks)
     groups = _group_trajectories(trajectories)
-    observed_max = max((len(groups.get(task.task_id, [])) for task in task_values), default=0)
-    rollout_width = expected_rollouts or max(1, observed_max)
+    observed_max_index = max(
+        (
+            trajectory.sample_index + 1
+            for task in task_values
+            for trajectory in groups.get(task.task_id, [])
+        ),
+        default=0,
+    )
+    rollout_width = expected_rollouts or max(1, observed_max_index)
     pass_width = min(pass_k or rollout_width, rollout_width)
     slots_by_task = {
         task.task_id: _slots(groups.get(task.task_id, []), rollout_width) for task in task_values
@@ -167,7 +174,7 @@ def evaluate_metrics(
         "pass@k": pass_at_k,
         "pass_at_1": pass_at_1,
         "pass_at_k": pass_at_k,
-        "group_reward_variance": _mean(group_variances),
+        "group_exact_match_variance": _mean(group_variances),
         "avg_tool_turns": _mean(tool_turns),
         "avg_search_calls": _mean(search_calls),
         "avg_visit_calls": _mean(visit_calls),
@@ -204,7 +211,22 @@ def _group_trajectories(
 
 
 def _slots(values: list[Trajectory], width: int) -> list[Trajectory | None]:
-    return list(values[:width]) + [None] * max(0, width - len(values))
+    slots: list[Trajectory | None] = [None] * width
+    seen: set[int] = set()
+    for trajectory in values:
+        sample_index = trajectory.sample_index
+        if sample_index < 0 or sample_index >= width:
+            raise ValueError(
+                f"sample_index {sample_index} for task {trajectory.task_id!r} "
+                f"is outside rollout width {width}"
+            )
+        if sample_index in seen:
+            raise ValueError(
+                f"duplicate sample_index {sample_index} for task {trajectory.task_id!r}"
+            )
+        seen.add(sample_index)
+        slots[sample_index] = trajectory
+    return slots
 
 
 def _empty_metrics(task_count: int, rollout_width: int) -> dict[str, Any]:
@@ -224,7 +246,7 @@ def _empty_metrics(task_count: int, rollout_width: int) -> dict[str, Any]:
         "pass@k": 0.0,
         "pass_at_1": 0.0,
         "pass_at_k": 0.0,
-        "group_reward_variance": 0.0,
+        "group_exact_match_variance": 0.0,
         "avg_tool_turns": 0.0,
         "avg_search_calls": 0.0,
         "avg_visit_calls": 0.0,
