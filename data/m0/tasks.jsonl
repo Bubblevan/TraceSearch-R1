@@ -1,0 +1,12 @@
+{"task_id":"task-001","question":"Which city hosts the Lumen Observatory?","answers":["Aster City","the city of Aster"],"split":"fixture","gold_evidence_ids":["doc-001"],"metadata":{"hop_count":1}}
+{"task_id":"task-002","question":"What is Cedar alloy made from?","answers":["copper, cedar fiber, and glass powder","copper cedar fiber glass powder"],"split":"fixture","gold_evidence_ids":["doc-002"],"metadata":{"hop_count":1}}
+{"task_id":"task-003","question":"Who mapped the source mountain of River Nera?","answers":["Sora Vale"],"split":"fixture","gold_evidence_ids":["doc-003","doc-004"],"metadata":{"hop_count":2}}
+{"task_id":"task-004","question":"Who stewards the relay station beside Blue Marsh?","answers":["Niko Rell"],"split":"fixture","gold_evidence_ids":["doc-005","doc-006"],"metadata":{"hop_count":2}}
+{"task_id":"task-005","question":"Who built the tower where comet Vesper was recorded?","answers":["Yara Quill"],"split":"fixture","gold_evidence_ids":["doc-007","doc-008"],"metadata":{"hop_count":2}}
+{"task_id":"task-006","question":"Who keeps the vault containing the Mica Archive silver code?","answers":["Ivo Sen"],"split":"fixture","gold_evidence_ids":["doc-009","doc-010"],"metadata":{"hop_count":2}}
+{"task_id":"task-007","question":"Who maintains the harbor bell at East Quay?","answers":["Mira Dax"],"split":"fixture","gold_evidence_ids":["doc-011","doc-012"],"metadata":{"hop_count":2}}
+{"task_id":"task-008","question":"Who founded the plain where the Juniper Array operates?","answers":["Tavi Moss"],"split":"fixture","gold_evidence_ids":["doc-013","doc-014"],"metadata":{"hop_count":2}}
+{"task_id":"task-009","question":"Where does River Nera end?","answers":["Lake Orin"],"split":"fixture","gold_evidence_ids":["doc-003"],"metadata":{"hop_count":1}}
+{"task_id":"task-010","question":"What does the Juniper Array send at dawn?","answers":["readings","weather readings"],"split":"fixture","gold_evidence_ids":["doc-013"],"metadata":{"hop_count":1}}
+{"task_id":"task-011","question":"Is a blank answer acceptable for a calibration no-search task?","answers":["yes"],"split":"calibration","gold_evidence_ids":[],"metadata":{"hop_count":0,"no_search":true}}
+{"task_id":"task-012","question":"What is the fixture policy's simple calibration answer?","answers":["calibration complete"],"split":"calibration","gold_evidence_ids":[],"metadata":{"hop_count":0,"no_search":true}}

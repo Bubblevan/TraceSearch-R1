@@ -1,5 +1,27 @@
-"""TraceSearch-R1: multi-turn search-agent research utilities."""
+"""TraceSearch-R1: reproducible multi-turn search-agent research utilities."""
 
-from tracesearch.agent.types import Action, ActionKind, Step, Trajectory
+from tracesearch.data.schema import (
+    Action,
+    ActionKind,
+    Document,
+    Evidence,
+    Step,
+    Task,
+    TerminationReason,
+    ToolErrorType,
+    ToolResult,
+    Trajectory,
+)
 
-__all__ = ["Action", "ActionKind", "Step", "Trajectory"]
+__all__ = [
+    "Action",
+    "ActionKind",
+    "Document",
+    "Evidence",
+    "Step",
+    "Task",
+    "TerminationReason",
+    "ToolErrorType",
+    "ToolResult",
+    "Trajectory",
+]

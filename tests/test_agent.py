@@ -1,6 +1,7 @@
 import unittest
+import asyncio
 
-from tracesearch.agent import Action, ActionKind, SearchAgent
+from tracesearch.agent import Action, ActionKind, SearchAgent, Task
 from tracesearch.environment import StaticSearchTool, StaticVisitTool
 
 
@@ -17,3 +18,19 @@ class SearchAgentTests(unittest.TestCase):
         self.assertEqual(result.termination, "answer")
         self.assertEqual(result.tool_turns, 1)
         self.assertIsNotNone(result.answer)
+
+    def test_async_policy_does_not_receive_evaluation_answers(self):
+        seen = []
+
+        class Policy:
+            async def act(self, task, trajectory):
+                seen.append((task.answers, task.gold_evidence_ids))
+                return Action(ActionKind.ANSWER, "fixture answer")
+
+        agent = SearchAgent(Policy(), StaticSearchTool({}), StaticVisitTool({}))
+        result = asyncio.run(
+            agent.run_async(Task("task-1", "Question", ["fixture answer"], "test", ["doc-1"]))
+        )
+
+        self.assertEqual(result.termination, "answer")
+        self.assertEqual(seen, [([], [])])

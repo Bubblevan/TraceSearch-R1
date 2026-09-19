@@ -1,18 +1,30 @@
-# Design notes
+# 设计说明
 
-## Experimental contract
+## 实验约定
 
-Every experiment must record the model, prompt/template version, search backend, data split, random seed, tool budget, token budget, reward formula, and API/model cost. Claims in the README or resume must link to a committed experiment report.
+每次实验都需要记录模型、提示词或模板版本、搜索后端、数据划分、随机种子、工具预算、token 预算、奖励公式以及 API 或模型成本。README 或简历中的结论，需要能够回到一份已经提交的实验报告。
 
-## Baseline and ablations
+这条约定解决的是复现问题：如果只保存最后的分数，之后很难判断差异来自模型、提示词、数据，还是搜索工具本身。轨迹和实验报告应当一起保存。
 
-1. Prompted search agent: fixed policy, no RL.
-2. Search-R1-style agentic RL: outcome and format rewards.
-3. + fatal-aware handling: mask from the first cascading failure; preserve valid prefix data.
-4. + contribution weighting: judge each search/visit step for retrieval utility and reasoning contribution, then scale the trajectory advantage per step.
+## 基线和消融
 
-The fourth setting is the project research hypothesis, not a pre-claimed improvement. It must be compared against the same model, data, search backend, and budget.
+当前研究计划包含以下几组设置：
 
-## Deferred work
+1. 提示驱动的搜索 Agent：使用固定策略，不进行 RL。
+2. Search-R1 风格的 Agentic RL：同时考虑结果奖励和格式奖励。
+3. 加入 fatal-aware 处理：从连续失败开始屏蔽后续学习信号，同时保留之前仍然有效的轨迹前缀。
+4. 加入贡献度分配：分别评估搜索和访问步骤对检索结果、推理过程的作用，再按步骤调整轨迹 advantage。
 
-Experience memory / self-evolving rollouts is deliberately deferred until the baseline and credit-assignment ablations are reproducible.
+第四组是待验证的研究假设，不是已经得到的效果结论。比较时需要固定模型、数据、搜索后端和预算，否则无法判断变化来自哪一项设计。
+
+## 当前代码边界
+
+Agent 循环负责在思考、搜索、访问和回答之间传递状态；环境工具负责返回结果；评价模块负责计算轨迹级指标；奖励模块只提供失败步骤定位和贡献度加权等辅助函数。工具接口和轨迹类型尽量保持小而稳定，方便后续接入不同的搜索实现。
+
+当前代码是文本型研究脚手架，不包含具体模型推理服务，也不把某个训练框架写进核心循环。默认工具使用确定性的离线数据，测试不依赖网络和外部凭证。
+
+## 暂缓内容
+
+经验记忆和自我演化式 rollout 暂时不进入基线。先把搜索行为、失败轨迹和贡献度分配的记录方式固定下来，再讨论记忆如何影响后续决策。
+
+模型训练、检索器训练和多模态工具也属于后续阶段。当前实现不对 RL 性能作出承诺。

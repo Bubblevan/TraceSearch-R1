@@ -1,37 +1,35 @@
 # TraceSearch-R1
 
-**A reproducible research scaffold for multi-turn Web Search Agents with contribution-aware credit assignment.**
+TraceSearch-R1 是一个用于研究多轮 Web Search Agent 的实验脚手架，当前关注两个问题：搜索过程中的失败如何影响后续轨迹，以及不同搜索步骤应当如何分配贡献度。
 
-TraceSearch-R1 studies an agent loop in which a language model alternates between reasoning, web search, page visits, and a cited final answer:
+项目中的基本交互链路是：
 
 ```text
-question → think → search(query) → evidence → visit(url) → evidence → answer
+问题 → 思考 → search(query) → 证据 → visit(url) → 证据 → 最终回答
 ```
 
-The project is intentionally text-only. It begins with a Search-R1-style interleaved search baseline, then evaluates two targeted extensions:
+这里的搜索、访问和回答都被当作 Agent 轨迹的一部分保存下来。后续实验可以据此分析：Agent 在哪一步发起了搜索、拿到了什么结果、是否继续访问页面，以及最后答案是否带有引用。
 
-1. **Fatal-aware trajectory handling**: stop learning from cascading tool failures while preserving usable prefixes.
-2. **Contribution-weighted credit assignment**: reweight trajectory advantages with per-step evidence contribution scores.
+## 当前范围
 
-## Scope
+- 研究代码保持为轻量的 Python 实现，不复制某个训练框架。
+- 搜索和页面访问通过小型工具接口接入，默认使用离线的确定性 fixture，测试不需要账号和网络。
+- 现有指标覆盖答案正确性、引用情况、搜索轮次、工具失败和成本等维度。
+- 当前提交不包含模型训练实现，也不对强化学习效果作出结论。
 
-- Reproducible research implementation; not a copy of a training framework.
-- Real search/visit integrations remain behind small tool interfaces.
-- Metrics include answer correctness, citation coverage, search turns, tool failures, and cost.
-
-## Repository layout
+## 目录结构
 
 ```text
 src/tracesearch/
-  agent/          Multi-turn control loop and trajectory types
-  environment/    Search / visit tool protocols and deterministic test tools
-  rewards/        Format, answer, fatal-aware, and contribution weighting helpers
-  evaluation/     Trajectory-level metrics
-tests/            Offline unit tests
-docs/             Design and experimental plan
+  agent/          多轮 Agent 控制循环和轨迹类型
+  environment/    搜索、访问工具协议和离线工具
+  rewards/        失败步骤与贡献度分配辅助函数
+  evaluation/     轨迹级指标
+tests/            离线单元测试
+docs/             设计说明和实验计划
 ```
 
-## Quick start
+## 快速开始
 
 ```bash
 python -m venv .venv
@@ -40,19 +38,25 @@ pip install -e ".[dev]"
 pytest
 ```
 
-## Research plan
+## 研究计划
 
-| Stage | Question | Deliverable |
+| 阶段 | 问题 | 产物 |
 | --- | --- | --- |
-| 0 | Does an interleaved agent use evidence correctly? | Deterministic offline baseline and trajectory logging |
-| 1 | Can SFT/RL improve search policy? | Search-R1-style training adapter and fixed evaluation split |
-| 2 | Do failure-aware masks prevent harmful updates? | Fatal-aware ablation |
-| 3 | Which search rounds matter? | Contribution-weighted GRPO ablation |
+| 0 | 多轮 Agent 能否正确使用搜索证据？ | 确定性的离线基线和轨迹记录 |
+| 1 | SFT/RL 是否能够改善搜索策略？ | Search-R1 风格的训练适配层和固定评测集 |
+| 2 | 失败感知的掩码能否减少有害更新？ | Fatal-aware 消融实验 |
+| 3 | 哪些搜索轮次真正影响最终答案？ | 基于贡献度的 GRPO 消融实验 |
 
-## Attribution
+阶段 0 只负责把实验边界和记录方式固定下来。阶段 1 及之后的训练工作，需要在同一套数据划分、搜索后端和预算条件下比较，不能把不同条件下的结果直接并列。
 
-The research direction is informed by Search-R1, DeepResearcher, OpenSearch-VL, and CW-GRPO. This repository will document any reused code, datasets, models, and results explicitly in experiment reports.
+## 复现约定
 
-## Status
+实验报告需要记录模型、提示词或模板版本、搜索后端、数据划分、随机种子、工具预算、token 预算、奖励公式以及 API 或模型成本。README 和简历中的实验结论，应当能够回到一份已提交的实验报告。
 
-Initial scaffold. The default tools are deterministic fixtures so tests never require credentials or network access.
+## 致谢与引用
+
+本项目的研究方向参考了 Search-R1、DeepResearcher、OpenSearch-VL 和 CW-GRPO。后续如复用代码、数据集、模型或实验结果，会在对应报告中标明来源。
+
+## 当前状态
+
+当前提交是初始研究脚手架。默认工具使用离线 fixture，因此现有测试可以在没有凭证和网络的环境中运行。后续扩展应继续保留可复现的轨迹记录和明确的实验边界。

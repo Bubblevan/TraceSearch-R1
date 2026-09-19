@@ -1,14 +1,6 @@
-.venv/
+runs/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.coverage
-dist/
-build/
-*.egg-info/
-.env
-outputs/
-checkpoints/
-wandb/
-data/raw/
-data/processed/
+.pytest-tmp/
+.venv/

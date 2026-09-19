@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-"""Compatibility exports for the original agent-facing schema module."""
+"""Canonical serializable data structures for TraceSearch experiments."""
 
 from tracesearch.data.schema import (
     Action,
