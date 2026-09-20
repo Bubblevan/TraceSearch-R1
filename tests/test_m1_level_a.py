@@ -133,12 +133,13 @@ def test_openai_compatible_client_fake_server_returns_actual_ids():
             client.generate(
                 [{"role": "user", "content": "Question"}],
                 model="fake-checkpoint",
-                config=LLMGenerationConfig(max_tokens=8),
+                config=LLMGenerationConfig(max_tokens=8, sampling_seed=17),
             )
         )
         assert generation.text == "<answer>Paris</answer>"
         assert generation.token_ids == (21, 22)
         assert received[0]["model"] == "fake-checkpoint"
+        assert received[0]["seed"] == 17
     finally:
         server.shutdown()
         thread.join(timeout=2)

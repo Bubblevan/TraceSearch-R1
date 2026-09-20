@@ -157,6 +157,8 @@ class OpenAICompatibleClient:
         }
         if config.top_k is not None:
             payload["top_k"] = config.top_k
+        if config.sampling_seed is not None:
+            payload["seed"] = config.sampling_seed
         if config.stop_sequences:
             payload["stop"] = list(config.stop_sequences)
         request = urllib.request.Request(
@@ -218,6 +220,7 @@ class OpenAICompatibleClient:
             token_ids=token_ids,
             logprobs=logprobs,
             prompt_token_ids=prompt_token_ids,
+            sampling_seed=None,
             metadata={"usage": body.get("usage"), "id": body.get("id")},
         )
 
