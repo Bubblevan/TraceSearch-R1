@@ -12,7 +12,7 @@ from tracesearch.agent import (
     derive_sampling_seed,
     gather_response_logprobs,
 )
-from tracesearch.data import Task
+from tracesearch.data import Step, Task, Trajectory
 from tracesearch.environment import StaticSearchTool, StaticVisitTool
 from tracesearch.training import GenerationRecord, TokenProvenanceError, TrainingTrace
 from tracesearch.training.grpo import grpo_loss
@@ -84,6 +84,21 @@ def test_missing_old_logprobs_is_not_silently_repaired():
             policy_version="fake",
             generation_records=[record],
         )
+
+
+def test_partial_generation_provenance_is_rejected():
+    task = Task("task", "Question", ["yes"], "dev")
+    first = GenerationRecord(step_index=0, prompt_ids=(1,), response_ids=(2,), response_logprobs=(0.0,))
+    trajectory = Trajectory(
+        question=task.question,
+        task_id=task.task_id,
+        steps=[
+            Step(thought="", action=Action(ActionKind.SEARCH, "q"), metadata={"generation_record": first.to_dict()}),
+            Step(thought="", action=Action(ActionKind.ANSWER, "yes"), metadata={"response_token_ids": [3]}),
+        ],
+    )
+    with pytest.raises(TokenProvenanceError, match="incomplete"):
+        TrainingTrace.from_trajectory(trajectory, observation_token_ids={0: (4,)}, policy_version="fake")
 
 
 def test_grpo_reduces_each_response_before_batch_average():

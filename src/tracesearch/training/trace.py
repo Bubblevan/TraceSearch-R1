@@ -326,12 +326,15 @@ class TrainingTrace:
     ) -> "TrainingTrace":
         """Project a rollout using gateway IDs; never reconstruct model output IDs."""
 
-        raw_records = [
-            GenerationRecord.from_dict(step.metadata["generation_record"])
-            for step in trajectory.steps
-            if isinstance(step.metadata.get("generation_record"), dict)
-        ]
+        raw_record_values = [step.metadata.get("generation_record") for step in trajectory.steps]
+        has_any_record = any(value is not None for value in raw_record_values)
+        if has_any_record and not all(isinstance(value, dict) for value in raw_record_values):
+            raise TokenProvenanceError("generation provenance is incomplete for the trajectory")
+        raw_records = [GenerationRecord.from_dict(value) for value in raw_record_values if isinstance(value, dict)]
         if raw_records:
+            expected_steps = [step.step_index for step in trajectory.steps]
+            if [record.step_index for record in raw_records] != expected_steps:
+                raise TokenProvenanceError("generation record steps do not match trajectory steps")
             tool_steps = [step.step_index for step in trajectory.steps if step.is_tool_step]
             return cls.from_generation_records(
                 task_id=trajectory.task_id or "",
