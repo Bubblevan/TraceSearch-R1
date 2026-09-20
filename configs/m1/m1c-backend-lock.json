@@ -47,8 +47,8 @@
     "The backend is run only from WSL2/Linux; the native Windows .venv is not modified.",
     "vLLM 0.22.1 resolves transformers 4.57.6; the earlier inspected transformers 5.5.3 source snapshot is not the runtime package.",
     "numpy is explicitly resolved at 2.3.5 because the current rLLM/veRL/vLLM metadata has incompatible numpy constraints.",
-    "flash-attn is optional and not required by this M1-C configuration; fused kernels remain disabled.",
-    "The first real C0 reached vLLM model load but failed during veRL-to-vLLM dynamic TensorLoRA sync with StopIteration in vLLM's merged-LoRA loader. The project therefore selects veRL's merged-LoRA weight-sync mode for the next run; no C0 completion is claimed until artifacts are produced.",
+    "flash-attn kernels are optional and remain disabled; the project provides only the layout-only bert_padding compatibility surface needed by veRL's SDPA path.",
+    "The first real C0 reached vLLM model load but failed during veRL-to-vLLM dynamic TensorLoRA sync with StopIteration; the merged-LoRA weight-sync mode then reached two real rollout generations. A subsequent veRL batch-postprocessing step exposed the missing optional flash-attn padding helper, now covered by the project compatibility module; no completed C0 training result is claimed until a post-hotfix rerun finishes.",
     "The WSL runner logs the actual EngineCore topology because veRL 0.8 hard-codes the async vLLM server executor backend to mp."
   ]
 }

@@ -234,13 +234,23 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu", 1)
 
     set_value("actor_rollout_ref.model.path", str(args.model))
+    # The unified config carries a separate reference-model path.  Leaving its
+    # DeepSeek example default in place can make colocated initialization load
+    # an unrelated checkpoint (or fail while probing a nonexistent path).
+    set_value("actor_rollout_ref.ref.model.path", str(args.model), force_add=True)
+    set_value("actor_rollout_ref.ref.model.use_shm", False, force_add=True)
+    set_value("actor_rollout_ref.ref.model.override_config.attn_implementation", "sdpa", force_add=True)
+    set_value("actor_rollout_ref.ref.use_torch_compile", False)
+    set_value("actor_rollout_ref.ref.fsdp_config.use_torch_compile", False)
     set_value("actor_rollout_ref.model.use_shm", False)
-    # The isolated WSL env intentionally does not require flash-attn.  veRL's
-    # HFModelConfig defaults to FlashAttention2, so select the portable SDPA
-    # path explicitly for this first backend integration.
+    # The isolated WSL env intentionally does not require the optional
+    # flash-attn extension.  veRL still routes its batch adapter through
+    # ``flash_attn.bert_padding``; the project ships a small layout-only
+    # compatibility module for that import.  Keep the actual FSDP model on
+    # the padded SDPA path so sequences cannot attend across sample boundaries.
     set_value("actor_rollout_ref.model.override_config.attn_implementation", "sdpa", force_add=True)
     set_value("actor_rollout_ref.model.enable_gradient_checkpointing", True)
-    set_value("actor_rollout_ref.model.use_remove_padding", True)
+    set_value("actor_rollout_ref.model.use_remove_padding", False)
     set_value("actor_rollout_ref.model.lora_rank", 8)
     set_value("actor_rollout_ref.model.lora_alpha", 16)
     set_value("actor_rollout_ref.model.lora.rank", 8)
@@ -267,6 +277,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.actor.use_dynamic_bsz", False)
     set_value("actor_rollout_ref.actor.shuffle", False)
     set_value("actor_rollout_ref.actor.use_torch_compile", False)
+    set_value("actor_rollout_ref.actor.fsdp_config.use_torch_compile", False)
     set_value("actor_rollout_ref.actor.entropy_coeff", 0.0)
     set_value("actor_rollout_ref.actor.use_kl_loss", False)
     set_value("actor_rollout_ref.actor.kl_loss_coef", 0.0)
