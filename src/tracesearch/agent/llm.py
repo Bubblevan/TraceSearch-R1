@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ class LLMGenerationConfig:
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     enable_thinking: bool = False
+    sampling_seed: int | None = None
     max_tokens: int = 256
     stop_sequences: tuple[str, ...] = ()
 
@@ -30,6 +32,8 @@ class LLMGenerationConfig:
             raise ValueError("top_k must be positive when set")
         if self.repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be positive")
+        if self.sampling_seed is not None and self.sampling_seed < 0:
+            raise ValueError("sampling_seed must be non-negative when set")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be positive")
 
@@ -39,7 +43,58 @@ class ModelGeneration:
     text: str
     token_ids: tuple[int, ...] | None = None
     logprobs: tuple[float, ...] | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
+    sampling_seed: int | None = None
+    finish_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def derive_sampling_seed(
+    task_id: str,
+    rollout_id: str,
+    sample_index: int,
+    step_index: int,
+    *,
+    base_seed: int | None = None,
+) -> int:
+    """Derive a stable per-generation seed from rollout identity."""
+
+    material = "|".join(
+        (
+            str(base_seed if base_seed is not None else 0),
+            task_id,
+            rollout_id,
+            str(sample_index),
+            str(step_index),
+        )
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), "big") & 0x7FFFFFFF
+
+
+def gather_response_logprobs(
+    logits: Any,
+    prompt_length: int,
+    response_token_ids: tuple[int, ...] | list[int],
+) -> tuple[float, ...]:
+    """Gather causal log-probabilities for supplied response IDs only."""
+
+    if getattr(logits, "ndim", None) != 3:
+        raise ValueError("logits must have shape [batch, sequence, vocabulary]")
+    if prompt_length < 1:
+        raise ValueError("prompt_length must be positive")
+    response = tuple(int(token) for token in response_token_ids)
+    if not response:
+        return ()
+    start = prompt_length - 1
+    end = start + len(response)
+    if end > logits.shape[1] - 1:
+        raise ValueError("logits do not contain one prediction for every response token")
+    import torch
+
+    response_logits = logits[:, start:end, :].float()
+    target = torch.tensor([response], dtype=torch.long, device=logits.device).unsqueeze(-1)
+    gathered = response_logits.log_softmax(dim=-1).gather(-1, target).squeeze(-1)[0]
+    return tuple(float(value) for value in gathered.detach().cpu().tolist())
 
 
 class ModelClient(Protocol):
@@ -148,10 +203,21 @@ class OpenAICompatibleClient:
         logprobs: tuple[float, ...] | None = None
         if isinstance(raw_logprobs, list) and all(isinstance(item, (int, float)) for item in raw_logprobs):
             logprobs = tuple(float(item) for item in raw_logprobs)
+        raw_prompt_ids = (
+            choice.get("prompt_token_ids")
+            or (message.get("prompt_token_ids") if isinstance(message, dict) else None)
+            or body.get("prompt_token_ids")
+        )
+        prompt_token_ids = None
+        if raw_prompt_ids is not None:
+            if not isinstance(raw_prompt_ids, list) or not all(isinstance(item, int) for item in raw_prompt_ids):
+                raise ModelClientError("model gateway prompt_token_ids must be a list of integers")
+            prompt_token_ids = tuple(raw_prompt_ids)
         return ModelGeneration(
             text=text,
             token_ids=token_ids,
             logprobs=logprobs,
+            prompt_token_ids=prompt_token_ids,
             metadata={"usage": body.get("usage"), "id": body.get("id")},
         )
 
@@ -211,6 +277,9 @@ class TransformersModelClient:
             low_cpu_mem_usage=True,
         )
         self._torch = torch
+        template = getattr(self.processor, "chat_template", None)
+        self.tokenizer_version = getattr(self.processor, "name_or_path", None) or "local-tokenizer"
+        self.template_version = hashlib.sha256(str(template).encode("utf-8")).hexdigest()[:16]
 
     async def generate(
         self,
@@ -239,6 +308,8 @@ class TransformersModelClient:
             key: value.to(model_device) if hasattr(value, "to") else value
             for key, value in inputs.items()
         }
+        if self.text_only:
+            return self._generate_text_only(messages, text, inputs, model_device, config)
         do_sample = config.temperature > 0
         generation_kwargs: dict[str, Any] = {
             **inputs,
@@ -260,11 +331,154 @@ class TransformersModelClient:
         return ModelGeneration(
             text=decoded,
             token_ids=token_ids,
-            metadata={
-                "backend": "transformers",
-                "model_path": self.model_path,
-                "device": str(model_device),
-                "prompt_token_count": int(prompt_length),
-                "response_token_count": len(token_ids),
-            },
+            prompt_token_ids=tuple(int(token) for token in inputs["input_ids"][0].tolist()),
+            sampling_seed=config.sampling_seed,
+            finish_reason="length",
+            metadata=self._generation_metadata(config, model_device, prompt_length, len(token_ids)),
         )
+
+    def _generate_text_only(
+        self,
+        messages: list[dict[str, str]],
+        text: str,
+        inputs: dict[str, Any],
+        model_device: Any,
+        config: LLMGenerationConfig,
+    ) -> ModelGeneration:
+        """Generate with a per-call torch.Generator for decoder-only text models."""
+
+        torch = self._torch
+        prompt_ids = tuple(int(token) for token in inputs["input_ids"][0].tolist())
+        actual_seed = config.sampling_seed if config.sampling_seed is not None else 0
+        generator = torch.Generator(device=model_device)
+        generator.manual_seed(actual_seed)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(inputs["input_ids"])
+        current_ids = inputs["input_ids"]
+        past_key_values = None
+        response_ids: list[int] = []
+        eos_token_id = getattr(self.processor, "eos_token_id", None)
+        for _ in range(config.max_tokens):
+            model_inputs: dict[str, Any] = {
+                "input_ids": current_ids,
+                "attention_mask": attention_mask,
+                "use_cache": True,
+            }
+            if past_key_values is not None:
+                model_inputs["past_key_values"] = past_key_values
+            outputs = self.model(**model_inputs)
+            logits = outputs.logits[:, -1, :].float()
+            logits = self._apply_repetition_penalty(logits, response_ids, config.repetition_penalty)
+            if config.temperature > 0:
+                logits = logits / config.temperature
+                logits = self._apply_top_k(logits, config.top_k)
+                logits = self._apply_top_p(logits, config.top_p)
+                probabilities = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1, generator=generator)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            token = int(next_token.item())
+            response_ids.append(token)
+            past_key_values = getattr(outputs, "past_key_values", None)
+            current_ids = next_token
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype, device=model_device)],
+                dim=1,
+            )
+            if eos_token_id is not None and token == eos_token_id:
+                break
+        response_tuple = tuple(response_ids)
+        decoded = self.processor.batch_decode([response_tuple], skip_special_tokens=True)[0]
+        finish_reason = "eos_token" if response_ids and response_ids[-1] == eos_token_id else "length"
+        response_logprobs = self.score_response_logprobs(prompt_ids, response_tuple)
+        return ModelGeneration(
+            text=decoded,
+            token_ids=response_tuple,
+            logprobs=response_logprobs,
+            prompt_token_ids=prompt_ids,
+            sampling_seed=actual_seed,
+            finish_reason=finish_reason,
+            metadata=self._generation_metadata(config, model_device, len(prompt_ids), len(response_ids)),
+        )
+
+    def score_response_logprobs(
+        self,
+        prompt_token_ids: tuple[int, ...] | list[int],
+        response_token_ids: tuple[int, ...] | list[int],
+    ) -> tuple[float, ...]:
+        """Score the supplied response IDs without decoding or sampling them."""
+
+        prompt = tuple(int(token) for token in prompt_token_ids)
+        response = tuple(int(token) for token in response_token_ids)
+        if not prompt:
+            raise ValueError("prompt_token_ids must not be empty")
+        if not response:
+            return ()
+        torch = self._torch
+        model_device = next(self.model.parameters()).device
+        full_ids = torch.tensor([prompt + response], dtype=torch.long, device=model_device)
+        attention_mask = torch.ones_like(full_ids)
+        with torch.no_grad():
+            logits = self.model(input_ids=full_ids, attention_mask=attention_mask, use_cache=False).logits
+        return gather_response_logprobs(logits, len(prompt), response)
+
+    def tokenize_text(self, text: str) -> tuple[int, ...]:
+        """Tokenize an environment-only string for a zero-loss observation span."""
+
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        encoded = self.processor(text=[text], return_tensors="pt")
+        return tuple(int(token) for token in encoded["input_ids"][0].tolist())
+
+    @staticmethod
+    def _apply_repetition_penalty(logits: Any, response_ids: list[int], penalty: float) -> Any:
+        if penalty == 1.0 or not response_ids:
+            return logits
+        import torch
+
+        values = logits.clone()
+        indices = list(dict.fromkeys(response_ids))
+        selected = values[:, indices]
+        values[:, indices] = torch.where(selected < 0, selected * penalty, selected / penalty)
+        return values
+
+    @staticmethod
+    def _apply_top_k(logits: Any, top_k: int | None) -> Any:
+        if top_k is None or top_k >= logits.shape[-1]:
+            return logits
+        values, _ = logits.topk(top_k, dim=-1)
+        return logits.masked_fill(logits < values[:, [-1]], float("-inf"))
+
+    @staticmethod
+    def _apply_top_p(logits: Any, top_p: float) -> Any:
+        if top_p >= 1.0:
+            return logits
+        sorted_logits, sorted_indices = logits.sort(descending=True, dim=-1)
+        cumulative = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        remove = cumulative > top_p
+        remove[:, 1:] = remove[:, :-1].clone()
+        remove[:, 0] = False
+        filtered = logits.clone()
+        filtered.scatter_(1, sorted_indices, sorted_logits.masked_fill(remove, float("-inf")))
+        return filtered
+
+    def _generation_metadata(self, config: LLMGenerationConfig, model_device: Any, prompt_count: int, response_count: int) -> dict[str, Any]:
+        return {
+            "backend": "transformers",
+            "model_path": self.model_path,
+            "checkpoint": self.model_path,
+            "device": str(model_device),
+            "prompt_token_count": int(prompt_count),
+            "response_token_count": int(response_count),
+            "tokenizer_version": self.tokenizer_version,
+            "template_version": self.template_version,
+            "sampling_seed": config.sampling_seed,
+            "sampling_config": {
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "top_k": config.top_k,
+                "repetition_penalty": config.repetition_penalty,
+                "enable_thinking": config.enable_thinking,
+            },
+        }

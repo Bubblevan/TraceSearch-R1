@@ -20,3 +20,7 @@ jobs:
         run: python -m tracesearch.cli.run_m0 --output runs/ci-smoke
       - name: Run M1 Level-A CLI smoke
         run: python -m tracesearch.cli.run_m1_eval --help
+      - name: Check M1 Level-B CLI boundaries
+        run: |
+          python -m tracesearch.cli.run_m1_rollout --help
+          python -m tracesearch.cli.prepare_m1_data --help

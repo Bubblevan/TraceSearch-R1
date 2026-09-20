@@ -70,8 +70,14 @@ def grpo_loss(
     kl_coef: float = 0.0,
     entropy_coef: float = 0.0,
     entropy: Any | None = None,
+    reference_logprobs: Any | None = None,
 ) -> Any:
-    """Compute the vanilla clipped GRPO loss over policy-generated tokens only."""
+    """Compute vanilla GRPO with equal weight per valid response sequence.
+
+    ``old_logprobs`` are behavior-policy probabilities for the importance
+    ratio.  They are never used as reference-policy probabilities.  A
+    positive ``kl_coef`` therefore requires explicit ``reference_logprobs``.
+    """
 
     import torch
 
@@ -94,18 +100,34 @@ def grpo_loss(
         raise ValueError("advantages must have shape [batch] or [batch, response_tokens]")
     if not 0 <= clip_epsilon < 1:
         raise ValueError("clip_epsilon must be in [0, 1)")
+    if kl_coef < 0 or entropy_coef < 0:
+        raise ValueError("regularization coefficients must be non-negative")
+    if kl_coef and reference_logprobs is None:
+        raise ValueError("reference_logprobs are required when kl_coef is non-zero")
+    if reference_logprobs is not None and reference_logprobs.shape != policy_logprobs.shape:
+        raise ValueError("reference_logprobs must align with policy_logprobs")
     ratio = torch.exp(policy_logprobs - old_logprobs)
     unclipped = ratio * advantage_tensor
     clipped = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantage_tensor
     objective = torch.minimum(unclipped, clipped)
-    token_count = mask.sum().clamp_min(1.0)
-    loss = -(objective * mask).sum() / token_count
+    active_counts = mask.sum(dim=1)
+    valid_sequences = active_counts > 0
+
+    def sequence_mean(values: Any) -> Any:
+        per_sequence = values.sum(dim=1) / active_counts.clamp_min(1.0)
+        if bool(valid_sequences.any()):
+            return per_sequence[valid_sequences].mean()
+        return values.sum() * 0.0
+
+    loss = -sequence_mean(objective * mask)
     if kl_coef:
-        loss = loss + kl_coef * (((old_logprobs - policy_logprobs) * mask).sum() / token_count)
+        loss = loss + kl_coef * sequence_mean((policy_logprobs - reference_logprobs) * mask)
     if entropy_coef:
         if entropy is None:
             raise ValueError("entropy tensor is required when entropy_coef is non-zero")
-        loss = loss - entropy_coef * ((entropy * mask).sum() / token_count)
+        if entropy.shape != policy_logprobs.shape:
+            raise ValueError("entropy must align with policy_logprobs")
+        loss = loss - entropy_coef * sequence_mean(entropy * mask)
     return loss
 
 
@@ -144,6 +166,7 @@ def optimizer_step(
         kl_coef=config.kl_coef,
         entropy_coef=config.entropy_coef,
         entropy=batch.get("entropy"),
+        reference_logprobs=batch.get("reference_logprobs"),
     )
     optimizer.zero_grad(set_to_none=True)
     loss.backward()

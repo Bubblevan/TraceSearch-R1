@@ -22,6 +22,7 @@ from tracesearch.environment import HTTPRetriever, StaticSearchTool, StaticVisit
 from tracesearch.training import (
     TokenTurn,
     TrainingTrace,
+    aggregate_group_diagnostics,
     compute_group_advantages,
     compute_outcome_reward,
     run_group_rollouts,
@@ -245,6 +246,9 @@ def test_group_rollouts_keep_failed_slots_and_ids():
     assert result.missing_rollouts == 1
     assert result.records[1].status == "failed"
     assert result.group_reward_mean == pytest.approx(2 / 3)
+    assert result.diagnostics.zero_variance_group is False
+    aggregate = aggregate_group_diagnostics([result])
+    assert aggregate["zero_variance_group_rate"] == 0.0
 
 
 def test_http_retriever_structured_search_and_visit():

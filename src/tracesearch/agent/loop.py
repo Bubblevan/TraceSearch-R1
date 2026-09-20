@@ -113,6 +113,9 @@ class SearchAgent:
                 failure_type = getattr(exc, "failure_type", None)
                 if failure_type is not None:
                     policy_metadata["parse_failure_type"] = getattr(failure_type, "value", str(failure_type))
+                generation_record = getattr(exc, "generation_record", None)
+                if generation_record is not None:
+                    policy_metadata["generation_record"] = generation_record.to_dict()
                 trajectory.steps.append(
                     Step(
                         step_index=step_index,
@@ -272,6 +275,10 @@ class SearchAgent:
             metadata["response_token_ids"] = list(output.response_token_ids)
         if output.response_logprobs is not None:
             metadata["response_logprobs"] = list(output.response_logprobs)
+        if output.prompt_token_ids is not None:
+            metadata["prompt_token_ids"] = list(output.prompt_token_ids)
+        if output.generation_record is not None:
+            metadata["generation_record"] = output.generation_record.to_dict()
         return metadata
 
     def _rollout_id(self, task: Task, sample_index: int) -> str:

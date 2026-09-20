@@ -6,6 +6,8 @@ from tracesearch.agent.llm import (
     ModelGeneration,
     OpenAICompatibleClient,
     TransformersModelClient,
+    derive_sampling_seed,
+    gather_response_logprobs,
 )
 from tracesearch.agent.parser import (
     ActionParseError,
@@ -41,6 +43,8 @@ __all__ = [
     "ModelGeneration",
     "OpenAICompatibleClient",
     "TransformersModelClient",
+    "derive_sampling_seed",
+    "gather_response_logprobs",
     "ActionParseError",
     "ParseFailureType",
     "ParsedPolicyOutput",

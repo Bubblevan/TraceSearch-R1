@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Protocol
 
-from tracesearch.agent.llm import LLMGenerationConfig, ModelClient
+from tracesearch.agent.llm import LLMGenerationConfig, ModelClient, derive_sampling_seed
 from tracesearch.agent.parser import ActionParseError, parse_policy_output
 from tracesearch.data.schema import Action, ActionKind, Task, Trajectory
+
+if TYPE_CHECKING:
+    from tracesearch.training.trace import GenerationRecord
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,8 @@ class PolicyOutput:
     raw_text: str | None = None
     response_token_ids: tuple[int, ...] | None = None
     response_logprobs: tuple[float, ...] | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
+    generation_record: Any | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -109,31 +114,45 @@ class LLMPolicy:
     async def act(self, task: Task, trajectory: Trajectory) -> PolicyOutput:
         policy_task = task.policy_view()
         messages = self._messages(policy_task, trajectory)
+        sampling_seed = derive_sampling_seed(
+            task.task_id,
+            trajectory.rollout_id or "",
+            trajectory.sample_index,
+            len(trajectory.steps),
+            base_seed=self.generation.sampling_seed,
+        )
+        generation_config = replace(self.generation, sampling_seed=sampling_seed)
         generation = await self.client.generate(
             messages,
             model=self.model,
-            config=self.generation,
+            config=generation_config,
         )
+        record = self._generation_record(trajectory, messages, generation, generation_config)
         if self.require_token_ids and generation.token_ids is None:
-            raise RuntimeError("model gateway did not return actual response token IDs")
+            error = RuntimeError("model gateway did not return actual response token IDs")
+            error.generation_record = record  # type: ignore[attr-defined]
+            raise error
         try:
             parsed = parse_policy_output(generation.text)
         except ActionParseError as exc:
             exc.raw_text = generation.text
+            exc.generation_record = record  # type: ignore[attr-defined]
             raise
         metadata = {
             "model": self.model,
             "prompt_template_version": self.prompt_template_version,
-            "temperature": self.generation.temperature,
-            "top_p": self.generation.top_p,
-            "top_k": self.generation.top_k,
-            "presence_penalty": self.generation.presence_penalty,
-            "repetition_penalty": self.generation.repetition_penalty,
-            "enable_thinking": self.generation.enable_thinking,
-            "max_generation_tokens": self.generation.max_tokens,
-            "stop_sequences": list(self.generation.stop_sequences),
+            "temperature": generation_config.temperature,
+            "top_p": generation_config.top_p,
+            "top_k": generation_config.top_k,
+            "presence_penalty": generation_config.presence_penalty,
+            "repetition_penalty": generation_config.repetition_penalty,
+            "enable_thinking": generation_config.enable_thinking,
+            "sampling_seed": generation.sampling_seed if generation.sampling_seed is not None else sampling_seed,
+            "max_generation_tokens": generation_config.max_tokens,
+            "stop_sequences": list(generation_config.stop_sequences),
             "mode": self.mode,
             "prompt_messages": messages,
+            "generation_record": record.to_dict(),
             **generation.metadata,
         }
         return PolicyOutput(
@@ -142,6 +161,51 @@ class LLMPolicy:
             raw_text=generation.text,
             response_token_ids=generation.token_ids,
             response_logprobs=generation.logprobs,
+            prompt_token_ids=generation.prompt_token_ids,
+            generation_record=record,
+            metadata=metadata,
+        )
+
+    def _generation_record(
+        self,
+        trajectory: Trajectory,
+        messages: list[dict[str, str]],
+        generation: Any,
+        config: LLMGenerationConfig,
+    ) -> GenerationRecord:
+        from tracesearch.training.trace import GenerationRecord
+
+        if generation.token_ids is None:
+            raise RuntimeError("generation record requires actual response token IDs")
+        metadata = dict(generation.metadata)
+        sampling_config = dict(metadata.get("sampling_config", {}))
+        if not sampling_config:
+            sampling_config = {
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "top_k": config.top_k,
+                "presence_penalty": config.presence_penalty,
+                "repetition_penalty": config.repetition_penalty,
+                "enable_thinking": config.enable_thinking,
+                "max_tokens": config.max_tokens,
+            }
+        return GenerationRecord(
+            step_index=len(trajectory.steps),
+            prompt_ids=generation.prompt_token_ids,
+            response_ids=generation.token_ids,
+            response_logprobs=generation.logprobs,
+            prompt_messages=tuple(dict(message) for message in messages),
+            model=self.model,
+            checkpoint=metadata.get("checkpoint") or metadata.get("model_path"),
+            tokenizer_version=metadata.get("tokenizer_version"),
+            template_version=metadata.get("template_version") or self.prompt_template_version,
+            sampling_config=sampling_config,
+            sampling_seed=(
+                generation.sampling_seed
+                if generation.sampling_seed is not None
+                else config.sampling_seed
+            ),
+            finish_reason=generation.finish_reason,
             metadata=metadata,
         )
 
