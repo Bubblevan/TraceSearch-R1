@@ -18,9 +18,10 @@ class ParseFailureType(StrEnum):
 
 
 class ActionParseError(ValueError):
-    def __init__(self, failure_type: ParseFailureType, message: str) -> None:
+    def __init__(self, failure_type: ParseFailureType, message: str, *, raw_text: str | None = None) -> None:
         super().__init__(message)
         self.failure_type = failure_type
+        self.raw_text = raw_text
 
 
 @dataclass(frozen=True)

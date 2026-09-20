@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from tracesearch.agent.llm import LLMGenerationConfig, ModelClient
-from tracesearch.agent.parser import parse_policy_output
+from tracesearch.agent.parser import ActionParseError, parse_policy_output
 from tracesearch.data.schema import Action, ActionKind, Task, Trajectory
 
 
@@ -116,12 +116,20 @@ class LLMPolicy:
         )
         if self.require_token_ids and generation.token_ids is None:
             raise RuntimeError("model gateway did not return actual response token IDs")
-        parsed = parse_policy_output(generation.text)
+        try:
+            parsed = parse_policy_output(generation.text)
+        except ActionParseError as exc:
+            exc.raw_text = generation.text
+            raise
         metadata = {
             "model": self.model,
             "prompt_template_version": self.prompt_template_version,
             "temperature": self.generation.temperature,
             "top_p": self.generation.top_p,
+            "top_k": self.generation.top_k,
+            "presence_penalty": self.generation.presence_penalty,
+            "repetition_penalty": self.generation.repetition_penalty,
+            "enable_thinking": self.generation.enable_thinking,
             "max_generation_tokens": self.generation.max_tokens,
             "stop_sequences": list(self.generation.stop_sequences),
             "mode": self.mode,
@@ -148,6 +156,8 @@ class LLMPolicy:
             system += " Answer directly without using search or visit."
         elif self.mode == "retrieve_once":
             system += " Use at most one search before answering."
+        else:
+            system += " For factual questions, the first turn must search before answering. Use the returned information before giving the final answer."
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.append({"role": "user", "content": task.question})
         for step in trajectory.steps:

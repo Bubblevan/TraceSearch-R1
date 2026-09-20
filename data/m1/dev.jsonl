@@ -1,3 +1,3 @@
-{"example_id":"m1-single-hop","question_text":"What is the capital of France?","answers":["Paris"],"gold_evidence_ids":["doc-france"]}
-{"example_id":"m1-two-hop","question_text":"Which city is associated with the Eiffel Tower and France?","answers":["Paris"],"gold_evidence_ids":["doc-eiffel","doc-france"]}
-{"example_id":"m1-no-search","question_text":"What color is the sky on a clear day?","answers":["blue"],"gold_evidence_ids":[]}
+{"example_id":"m1-single-hop","question_text":"Which city hosts the Lumen Observatory?","answers":["Aster City","the city of Aster"],"gold_evidence_ids":["doc-001"]}
+{"example_id":"m1-two-hop","question_text":"Who mapped the source mountain of River Nera?","answers":["Sora Vale"],"gold_evidence_ids":["doc-003","doc-004"]}
+{"example_id":"m1-no-search","question_text":"Is a blank answer acceptable for a calibration no-search task?","answers":["yes"],"gold_evidence_ids":[]}

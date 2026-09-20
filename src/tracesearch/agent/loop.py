@@ -106,13 +106,20 @@ class SearchAgent:
             try:
                 output = await self._ask_policy(task, trajectory)
             except Exception as exc:
+                policy_metadata: dict[str, Any] = {"failure_class": "policy_error"}
+                raw_output = getattr(exc, "raw_text", None)
+                if raw_output is not None:
+                    policy_metadata["policy_raw_output"] = raw_output
+                failure_type = getattr(exc, "failure_type", None)
+                if failure_type is not None:
+                    policy_metadata["parse_failure_type"] = getattr(failure_type, "value", str(failure_type))
                 trajectory.steps.append(
                     Step(
                         step_index=step_index,
                         thought="",
                         action=Action(ActionKind.ANSWER, ""),
                         error=f"{type(exc).__name__}: {exc}",
-                        metadata={"failure_class": "policy_error"},
+                        metadata=policy_metadata,
                     )
                 )
                 trajectory.termination_reason = TerminationReason.POLICY_ERROR
