@@ -247,7 +247,7 @@ class TransformersModelClient:
             "top_p": config.top_p,
             "repetition_penalty": config.repetition_penalty,
         }
-        if config.top_k is not None:
+        if do_sample and config.top_k is not None:
             generation_kwargs["top_k"] = config.top_k
         if do_sample:
             generation_kwargs["temperature"] = config.temperature
