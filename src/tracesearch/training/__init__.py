@@ -21,6 +21,7 @@ from tracesearch.training.trace import (
     build_training_trace,
 )
 from tracesearch.training.rllm_adapter import RLLMAdapter, RLLMEpisode, RLLMTask
+from tracesearch.training.rllm_workflow import RLLMModelClient, TraceSearchWorkflow, backend_import_status
 
 __all__ = [
     "GRPOConfig",
@@ -43,4 +44,7 @@ __all__ = [
     "RLLMAdapter",
     "RLLMEpisode",
     "RLLMTask",
+    "RLLMModelClient",
+    "TraceSearchWorkflow",
+    "backend_import_status",
 ]

@@ -1,0 +1,54 @@
+{
+  "schema_version": "tracesearch.m1c.backend-lock.v1",
+  "environment": {
+    "platform": "WSL2 Ubuntu-24.04",
+    "python": "3.12.3",
+    "manager": "uv",
+    "environment_path": ".venvs/tracesearch-m1c",
+    "native_windows_venv": "not used"
+  },
+  "source_commits": {
+    "rllm": "3b40c37cf6a262cf4d28cc987ebe4f4cf797956c",
+    "verl": "7aed6b230776f963fa09509c10d9c3a767d1102c",
+    "vllm": "0decac0d96c42b49572498019f0a0e3600f50398"
+  },
+  "runtime_versions": {
+    "rllm": "0.3.0rc0",
+    "verl": "0.8.0.dev0",
+    "vllm": "0.22.1",
+    "torch": "2.11.0",
+    "transformers": "4.57.6",
+    "ray": "2.58.0",
+    "numpy": "2.3.5",
+    "flashinfer-python": "0.6.11.post2",
+    "flashinfer-cubin": "0.6.11.post2"
+  },
+  "runner_contract": {
+    "gpu": "single visible CUDA GPU",
+    "vllm_engine": "V1",
+    "vllm_enable_v1_multiprocessing": false,
+    "verl_async_server_distributed_executor_backend": "mp (hard-coded by veRL 0.8 async server)",
+    "tensor_model_parallel_size": 1,
+    "max_model_len": 1024,
+    "cpu_offload_gb": 4.0,
+    "attention": "sdpa",
+    "lora_sync": "merged_base_weights",
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "notes": [
+    "The backend is run only from WSL2/Linux; the native Windows .venv is not modified.",
+    "vLLM 0.22.1 resolves transformers 4.57.6; the earlier inspected transformers 5.5.3 source snapshot is not the runtime package.",
+    "numpy is explicitly resolved at 2.3.5 because the current rLLM/veRL/vLLM metadata has incompatible numpy constraints.",
+    "flash-attn is optional and not required by this M1-C configuration; fused kernels remain disabled.",
+    "The first real C0 reached vLLM model load but failed during veRL-to-vLLM dynamic TensorLoRA sync with StopIteration in vLLM's merged-LoRA loader. The project therefore selects veRL's merged-LoRA weight-sync mode for the next run; no C0 completion is claimed until artifacts are produced.",
+    "The WSL runner logs the actual EngineCore topology because veRL 0.8 hard-codes the async vLLM server executor backend to mp."
+  ]
+}
