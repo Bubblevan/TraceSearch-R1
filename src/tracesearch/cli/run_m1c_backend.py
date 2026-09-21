@@ -13,6 +13,7 @@ import importlib.metadata as package_metadata
 import json
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -51,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
+    parser.add_argument("--task-id", default=None, help="Select exactly one declared task by task_id without reordering the dataset.")
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="Clear known M1-C artifacts in an existing output directory before starting.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--cpu-offload-gb", type=float, default=None)
     parser.add_argument(
@@ -75,6 +82,51 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _write_run_status(output: Path, status: str, **extra: Any) -> None:
     _write_json(output / "run_status.json", {"status": status, "updated_at": time.time(), **extra})
+
+
+_KNOWN_RUN_ARTIFACTS = (
+    "backend_manifest.json",
+    "resolved_config.json",
+    "run_status.json",
+    "failure.json",
+    "tracesearch_rollouts.jsonl",
+    "rollout_groups.jsonl",
+    "backend_batch_summary.json",
+    "metrics.json",
+    "training_observer.json",
+    "live_mask_parity.json",
+    "live_advantage_parity.json",
+    "mask_parity.json",
+    "advantage_parity.json",
+    "flash_attn_provenance.json",
+    "rollout_logprob_diagnostics.json",
+    "parameter_delta.json",
+    "checkpoint_proof.json",
+    "checkpoint_reload.json",
+    "checkpoint_reload_process.log",
+    "summary.md",
+    "pre_update",
+    "checkpoints",
+    "parameter_probe",
+    "pre_update_error.json",
+    "console.log",
+)
+
+
+def _prepare_output(output: Path, *, overwrite: bool) -> None:
+    """Refuse stale M1-C evidence unless the caller explicitly opts in."""
+
+    output.mkdir(parents=True, exist_ok=True)
+    existing = [output / name for name in _KNOWN_RUN_ARTIFACTS if (output / name).exists()]
+    if existing and not overwrite:
+        names = ", ".join(path.name for path in existing)
+        raise FileExistsError(f"output directory contains prior M1-C artifacts: {names}; use --overwrite-output")
+    if overwrite:
+        for path in existing:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
 
 def _git(repo: Path, *args: str) -> str | None:
@@ -126,12 +178,17 @@ def _backend_versions() -> dict[str, Any]:
     return result
 
 
-def _load_tasks(path: Path, task_count: int) -> tuple[list[Any], dict[str, Any]]:
+def _load_tasks(path: Path, task_count: int, task_id: str | None = None) -> tuple[list[Any], dict[str, Any]]:
     dataset = NQTaskAdapter(
         upstream_dataset="natural_questions_style_fixture",
         upstream_revision="local-m1-fixture",
     ).load_jsonl(path, split="train")
-    if task_count > 0:
+    if task_id is not None:
+        matches = [task for task in dataset.tasks if task.task_id == task_id]
+        if not matches:
+            raise ValueError(f"task_id {task_id!r} not found in {path}")
+        tasks = matches
+    elif task_count > 0:
         tasks = list(dataset.tasks[:task_count])
     else:
         tasks = list(dataset.tasks)
@@ -557,66 +614,198 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _load_lora_checkpoint(path: Path) -> dict[str, Any]:
+    """Load only LoRA tensors from one real veRL actor checkpoint tree."""
+
+    try:
+        import torch
+    except Exception as exc:  # pragma: no cover - backend environment dependent.
+        return {"path": str(path), "error": f"{type(exc).__name__}: {exc}", "files": [], "tensors": {}}
+
+    files = sorted(path.rglob("model_world_size_*_rank_*.pt")) if path.exists() else []
+    tensors: dict[str, Any] = {}
+    errors: list[str] = []
+    for file in files:
+        try:
+            payload = torch.load(file, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+                payload = payload["state_dict"]
+            if not isinstance(payload, dict):
+                errors.append(f"{file}: payload is {type(payload).__name__}")
+                continue
+            for name, value in payload.items():
+                if "lora" not in str(name).lower() or not hasattr(value, "detach"):
+                    continue
+                tensors[str(name)] = value.detach().float().cpu().contiguous()
+        except Exception as exc:
+            errors.append(f"{file}: {type(exc).__name__}: {exc}")
+
+    digest = hashlib.sha256()
+    tensor_meta: dict[str, Any] = {}
+    total_parameters = 0
+    for name in sorted(tensors):
+        tensor = tensors[name]
+        raw = tensor.numpy().tobytes()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(raw)
+        tensor_meta[name] = {"shape": list(tensor.shape), "numel": int(tensor.numel())}
+        total_parameters += int(tensor.numel())
+    return {
+        "path": str(path),
+        "files": [str(file) for file in files],
+        "file_count": len(files),
+        "tensors": tensors,
+        "tensor_meta": tensor_meta,
+        "tensor_count": len(tensors),
+        "total_parameters": total_parameters,
+        "digest": digest.hexdigest() if tensors else None,
+        "errors": errors,
+    }
+
+
+def _checkpoint_delta_evidence(output: Path) -> dict[str, Any]:
+    """Compare the pre-update worker snapshot with the saved actor checkpoint.
+
+    The comparison intentionally uses files written by veRL's actor worker.
+    Parameter probes remain useful diagnostics, but cannot prove that the
+    optimizer changed policy parameters because they wrap an internal method.
+    """
+
+    before = _load_lora_checkpoint(output / "pre_update" / "actor")
+    after = _load_lora_checkpoint(output / "checkpoints" / "global_step_1" / "actor")
+    before_tensors = before.get("tensors", {})
+    after_tensors = after.get("tensors", {})
+    common = sorted(set(before_tensors) & set(after_tensors))
+    changed_names: list[str] = []
+    max_abs = 0.0
+    squared_l2 = 0.0
+    for name in common:
+        left = before_tensors[name]
+        right = after_tensors[name]
+        if tuple(left.shape) != tuple(right.shape):
+            changed_names.append(name)
+            max_abs = float("inf")
+            continue
+        delta = (right - left).abs()
+        current_max = float(delta.max().item()) if delta.numel() else 0.0
+        if current_max > 0.0:
+            changed_names.append(name)
+        max_abs = max(max_abs, current_max)
+        squared_l2 += float((delta * delta).sum().item())
+    return {
+        "evidence_source": "checkpoint_delta",
+        "before_checkpoint": before.get("path"),
+        "after_checkpoint": after.get("path"),
+        "before_file_count": before.get("file_count", 0),
+        "after_file_count": after.get("file_count", 0),
+        "before_tensor_count": before.get("tensor_count", 0),
+        "after_tensor_count": after.get("tensor_count", 0),
+        "common_tensor_count": len(common),
+        "before_total_trainable_parameters": before.get("total_parameters", 0),
+        "after_total_trainable_parameters": after.get("total_parameters", 0),
+        "before_policy_digest": before.get("digest"),
+        "after_policy_digest": after.get("digest"),
+        "changed_trainable_tensor_count": len(changed_names),
+        "changed_tensor_names": changed_names,
+        "max_abs_parameter_delta": max_abs if common else None,
+        "total_l2_parameter_delta": squared_l2**0.5 if common else None,
+        "nonzero_parameter_updates": len(changed_names),
+        "before_errors": before.get("errors", []),
+        "after_errors": after.get("errors", []),
+    }
+
+
 def _parameter_evidence(output: Path) -> dict[str, Any]:
+    checkpoint = _checkpoint_delta_evidence(output)
     probes = []
     for path in sorted((output / "parameter_probe").glob("actor_update_*.json")):
         try:
             probes.append(json.loads(path.read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             continue
-    successful = [item for item in probes if item.get("update_succeeded")]
-    changed = sum(int(item.get("changed_trainable_tensor_count", 0)) for item in successful)
-    max_abs = max((float(item.get("max_abs_parameter_delta", 0.0)) for item in successful), default=0.0)
-    l2 = sum(float(item.get("total_l2_parameter_delta", 0.0)) ** 2 for item in successful) ** 0.5
-    before = successful[0].get("before") if successful else None
-    after = successful[-1].get("after") if successful else None
-    before_digest = before.get("trainable_parameter_digest") if before else None
-    after_digest = after.get("trainable_parameter_digest") if after else None
     return {
         "probe_count": len(probes),
-        "successful_probe_count": len(successful),
-        "trainable_tensor_count": len((before or {}).get("trainable_tensors", {})) if before else None,
-        "total_trainable_parameters": (before or {}).get("total_trainable_parameters") if before else None,
-        "total_model_parameters": (before or {}).get("total_model_parameters") if before else None,
-        "trainable_parameter_percentage": (
-            100.0 * float((before or {}).get("total_trainable_parameters", 0)) / float((before or {}).get("total_model_parameters", 1))
-            if before and (before or {}).get("total_model_parameters")
-            else None
-        ),
-        "changed_trainable_tensor_count": changed,
-        "max_abs_parameter_delta": max_abs if successful else None,
-        "total_l2_parameter_delta": l2 if successful else None,
-        "before_policy_digest": before_digest,
-        "after_policy_digest": after_digest,
-        "nonzero_parameter_updates": changed,
+        "successful_probe_count": sum(1 for item in probes if item.get("update_succeeded")),
+        "probe_evidence_source": "diagnostic_only",
+        **checkpoint,
         "probes": probes,
     }
 
 
-def _runtime_metrics(output: Path, args: argparse.Namespace, observer: RuntimeTrainingObserver | None) -> dict[str, Any]:
-    batches = observer.records if observer is not None else []
-    # The real ``VerlBackend`` lives in the Ray ``VerlTaskRunner``.  Its
-    # observer therefore writes a durable record from that process instead of
-    # mutating the CLI driver's observer object.  Prefer the in-process view,
-    # but read the remote record when the driver has no batches so counters in
-    # ``metrics.json`` remain runtime-derived and internally consistent.
+def _observer_batches(output: Path, observer: RuntimeTrainingObserver | None) -> list[dict[str, Any]]:
+    batches = list(observer.records) if observer is not None else []
     observer_path = output / "training_observer.json"
     if not batches and observer_path.exists():
         try:
             remote = json.loads(observer_path.read_text(encoding="utf-8"))
             batches = list(remote.get("batches", []))
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            batches = []
+            pass
+    return batches
+
+
+def _runtime_groups(output: Path, tasks: list[Any], group_size: int, observer: RuntimeTrainingObserver | None) -> list[dict[str, Any]]:
+    """Read groups from the live Ray observer before derived artifacts exist."""
+
+    groups_by_key: dict[str, dict[str, Any]] = {}
+    for batch in _observer_batches(output, observer):
+        for group in batch.get("groups", []):
+            key = str(group.get("group_id") or (group.get("task_ids") or [""])[0])
+            groups_by_key[key] = group
+    if groups_by_key:
+        return list(groups_by_key.values())
+
+    # A backend may finish its durable rollout JSONL write without reaching
+    # the observer hook.  Use the same explicit missing-slot policy as the
+    # evaluator, but do not silently treat an absent group as a successful run.
+    if (output / "tracesearch_rollouts.jsonl").exists():
+        return _groups_from_rollouts(output, tasks, group_size)
+    return []
+
+
+def _groups_from_rollouts(output: Path, tasks: list[Any], group_size: int) -> list[dict[str, Any]]:
+    source = output / "tracesearch_rollouts.jsonl"
+    latest: dict[tuple[str, int], dict[str, Any]] = {}
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            latest[(str(row["task_id"]), int(row["sample_index"]))] = row
+    groups: list[dict[str, Any]] = []
+    for task in tasks:
+        slots = [latest.get((task.task_id, index)) for index in range(group_size)]
+        rewards = [float(row["reward"]["total"]) if row is not None else 0.0 for row in slots]
+        mean = statistics.mean(rewards) if rewards else 0.0
+        groups.append(
+            {
+                "group_id": task.task_id,
+                "task_ids": [task.task_id] * group_size,
+                "rewards": rewards,
+                "group_exact_match_variance": statistics.pvariance(rewards) if rewards else 0.0,
+                "missing_slots": [index for index, row in enumerate(slots) if row is None],
+                "reward_mean": mean,
+            }
+        )
+    return groups
+
+
+def _runtime_metrics(output: Path, args: argparse.Namespace, observer: RuntimeTrainingObserver | None) -> dict[str, Any]:
+    batches = _observer_batches(output, observer)
     parameter_evidence = _parameter_evidence(output)
     observed_actor_update_calls = sum(int(row.get("observed_actor_update_calls", 0)) for row in batches)
-    probe_count = int(parameter_evidence["probe_count"])
+    gates = [row.get("update_gate") for row in batches if row.get("update_gate")]
+    mask_parities = [row.get("live_mask_parity") for row in batches if row.get("live_mask_parity") is not None]
+    advantage_parities = [row.get("live_advantage_parity") for row in batches if row.get("live_advantage_parity") is not None]
     return {
         "phase": args.phase,
         "requested_optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
         "observed_actor_update_calls": observed_actor_update_calls if batches else None,
-        "observed_optimizer_steps": probe_count if batches else None,
+        "observed_optimizer_steps": None,
         "nonzero_parameter_updates": parameter_evidence["nonzero_parameter_updates"],
-        "optimizer_steps_source": "runtime observer and actor parameter probes; never inferred from phase",
+        "optimizer_steps_source": "not_claimed; checkpoint delta is the C1 update proof",
+        "update_gates": gates,
+        "live_mask_parity": all(item.get("parity") is True for item in mask_parities) if mask_parities else None,
+        "live_advantage_parity": all(item.get("parity") is True for item in advantage_parities) if advantage_parities else None,
         "batches": batches,
         "parameter_evidence": {key: value for key, value in parameter_evidence.items() if key != "probes"},
     }
@@ -627,12 +816,20 @@ def _c1_status(phase: str, groups: list[dict[str, Any]], metrics: dict[str, Any]
 
     if phase != "c1":
         return "completed"
+    if not groups:
+        return "backend_failed"
     if not any(float(group.get("group_exact_match_variance", 0.0)) > 0.0 for group in groups):
         return "no_learning_signal"
+    if "parity_failed" in metrics.get("update_gates", []):
+        return "parity_failed"
+    if "update_failed" in metrics.get("update_gates", []):
+        return "update_failed"
+    if metrics.get("live_mask_parity") is False or metrics.get("live_advantage_parity") is False:
+        return "parity_failed"
     if int(metrics.get("observed_actor_update_calls") or 0) <= 0:
-        return "failed"
+        return "update_failed"
     if int(metrics.get("nonzero_parameter_updates") or 0) <= 0:
-        return "failed"
+        return "update_failed"
     return "completed"
 
 
@@ -721,6 +918,7 @@ def _write_artifacts(
             "lora_sync": "merged_base_weights",
         },
         "dataset": provenance,
+        "selected_task_ids": [task.task_id for task in tasks],
         "model": str(args.model),
         "seed": args.seed,
         "group_size": args.group_size,
@@ -762,10 +960,13 @@ def _write_artifacts(
         {
             "checkpoint_path": str(checkpoint_path),
             "checkpoint_step": 1 if checkpoint_path.exists() else None,
+            "pre_update_snapshot": str(output / "pre_update" / "actor") if (output / "pre_update" / "actor").exists() else None,
             "policy_tensor_digest_before_update": parameter_evidence["before_policy_digest"],
             "policy_tensor_digest_after_update": parameter_evidence["after_policy_digest"],
             "observed_actor_update_count": metrics["observed_actor_update_calls"],
             "observed_nonzero_policy_update_count": parameter_evidence["nonzero_parameter_updates"],
+            "observed_optimizer_steps": metrics["observed_optimizer_steps"],
+            "evidence_source": parameter_evidence["evidence_source"],
         },
     )
     if failure is not None:
@@ -814,7 +1015,7 @@ def run(args: argparse.Namespace) -> int:
         # workflow module applies the C0 initial-sync guard there on import.
         os.environ["TRACESEARCH_C0_SGLANG_SKIP_INITIAL_SYNC"] = "1"
     output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    _prepare_output(output, overwrite=args.overwrite_output)
     _write_run_status(output, "initializing", phase=args.phase)
     os.environ["TRACESEARCH_M1C_OBSERVER_DIR"] = str(output)
     tasks: list[Any] = []
@@ -823,7 +1024,7 @@ def run(args: argparse.Namespace) -> int:
     observer: RuntimeTrainingObserver | None = None
     c0_batch_weight_sync = "not_applicable"
     try:
-        tasks, provenance = _load_tasks(Path(args.dataset), args.task_count)
+        tasks, provenance = _load_tasks(Path(args.dataset), args.task_count, args.task_id)
         config = _compose_config(args, output)
         _write_json(output / "resolved_config.json", __import__("omegaconf").OmegaConf.to_container(config, resolve=False))
         _write_run_status(output, "running", phase=args.phase, task_count=len(tasks), group_size=args.group_size)
@@ -866,14 +1067,12 @@ def run(args: argparse.Namespace) -> int:
                 c0_batch_weight_sync = f"{c0_batch_weight_sync}; initial_sglang=worker_import_guard"
         trainer.train()
 
-        summary_rows = []
-        groups_path = output / "rollout_groups.jsonl"
-        if groups_path.exists():
-            summary_rows = [json.loads(line) for line in groups_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        status = _c1_status(args.phase, summary_rows, _runtime_metrics(output, args, observer))
+        runtime_metrics = _runtime_metrics(output, args, observer)
+        runtime_groups = _runtime_groups(output, tasks, args.group_size, observer)
+        status = _c1_status(args.phase, runtime_groups, runtime_metrics)
         if status == "completed" and args.phase == "c1":
             if not _run_checkpoint_reload(output, str(args.model)):
-                status = "failed"
+                status = "reload_failed"
         _write_artifacts(
             output,
             args,
@@ -885,8 +1084,8 @@ def run(args: argparse.Namespace) -> int:
             status=status,
         )
         _write_run_status(output, status, phase=args.phase)
-        if status == "failed":
-            raise RuntimeError("C1 proof gate failed: non-zero group signal had no observed actor/parameter update")
+        if status in {"backend_failed", "update_failed", "reload_failed"}:
+            raise RuntimeError(f"C1 proof gate failed with status={status}")
         return 0
     except Exception as exc:
         if config is not None and tasks:
@@ -913,6 +1112,8 @@ def run(args: argparse.Namespace) -> int:
     finally:
         os.environ.pop("TRACESEARCH_M1C_OBSERVER_DIR", None)
         os.environ.pop("TRACESEARCH_M1C_PHASE", None)
+        os.environ.pop("TRACESEARCH_C0_SKIP_BATCH_END_SYNC", None)
+        os.environ.pop("TRACESEARCH_C0_SGLANG_SKIP_INITIAL_SYNC", None)
 
 
 def main(argv: list[str] | None = None) -> int:

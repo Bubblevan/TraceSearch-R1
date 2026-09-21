@@ -12,7 +12,6 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-          activate-environment: true
       # setup-uv owns the single project .venv; do not create it a second time.
       - run: uv pip install -e ".[dev]"
       - run: uv run pytest
