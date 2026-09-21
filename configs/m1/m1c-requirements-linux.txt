@@ -1,0 +1,33 @@
+# TraceSearch-R1 M1-C backend runtime.
+#
+# This is intentionally Linux-only and is installed by
+# scripts/bootstrap_m1c_uv.sh into .venvs/tracesearch-m1c.  Do not install it
+# into the project-root .venv and do not combine it with the SGLang lock.
+#
+# The three Git requirements are pinned to the source commits recorded in
+# m1c-backend-lock.json.  The FlashAttention wheel is also pinned by URL and
+# SHA256 because it is a community prebuilt wheel, not a PyPI dependency.
+#
+# Do not write rllm[verl] here: that extra asks for the released verl==0.8.0,
+# while this experiment intentionally pins the veRL 0.8.0.dev0 Git commit.
+
+accelerate==1.15.0
+flashinfer-cubin==0.6.11.post2
+flashinfer-python==0.6.11.post2
+hydra-core==1.3.2
+numpy==2.3.5
+omegaconf==2.3.0
+packaging>=24
+pillow>=10
+pytest>=8
+ray==2.58.0
+safetensors>=0.4
+torch==2.11.0
+transformers==4.57.6
+vllm==0.22.1
+
+verl @ git+https://github.com/verl-project/verl.git@7aed6b230776f963fa09509c10d9c3a767d1102c
+rllm @ git+https://github.com/rllm-org/rllm.git@3b40c37cf6a262cf4d28cc987ebe4f4cf797956c
+
+# cp312 / Linux x86_64 / CUDA 13 / Torch 2.11 / CXX11 ABI.
+flash-attn @ https://huggingface.co/spaces/prithivMLmods/Image-to-3D-Video-Asset-Generator/resolve/main/flash_attention_2/flash_attn-2.8.3%2Bcu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=eea423825f3e12818b98b2078e2cb5ce6fe6b73d22612316d2a55fad4701938f

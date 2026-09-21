@@ -10,6 +10,55 @@
 - 当前仓库直接在 `main` 上工作。实验结果必须记录 commit、dirty 状态、运行时配置、模型路径和完整命令。
 - C1 的安全停止条件优先于“把程序跑完”：C1 的零信号 gate 可以停止单次 proof；C2 不得复用这个 gate，零方差 batch 仍必须进入正常 vanilla-GRPO 训练循环并被记录。
 
+## 远程 Linux/L40 执行规则
+
+- 当前默认工作树是 `main`，不创建 feature branch。远程 Codex 首先执行
+  `git rev-parse HEAD`、`git status --short`，确认提交和 dirty 状态，再做任何
+  运行或修改。
+- 根目录 `.venv` 只用于测试和轻量 CLI。M1-C 后端必须使用 Linux 原生文件系统
+  中的 `.venvs/tracesearch-m1c`，由 `bash scripts/bootstrap_m1c_uv.sh` 创建；
+  不使用 conda，不从 Windows `/mnt/*` 挂载盘复制 virtualenv。
+- 后端依赖输入是
+  `configs/m1/m1c-requirements-linux.txt`，解析 override 是
+  `configs/m1/m1c-uv-overrides.txt`，实际安装使用提交的
+  `configs/m1/m1c-requirements-linux.lock.txt`。不要用 `uv pip install -e ".[m1]"` 或
+  手工升级 Torch、Transformers、vLLM、rLLM、veRL；任何版本变更都必须同时
+  更新 backend lock 和运行证据。
+- `configs/m1/runtime/l40-48g-linux.yaml` 是 L40 48 GiB 的未验证单卡 profile，
+  不是历史 4090/16 GiB WSL profile 的事实替代。原生 Linux 默认 CUDA IPC；
+  `--force-shm-weight-transfer` 只用于确认过的 WSL CUDA IPC 故障。
+- SGLang 必须安装到单独的 `.venvs/tracesearch-sglang`，使用
+  `configs/m1/sglang-requirements-linux.txt`；禁止为了“方便”把它合并到
+  vLLM/rLLM/veRL 环境。
+- 首次运行先执行 `python scripts/verify_m1c_env.py`。它必须能导入
+  `rllm.trainer.config`、`verl.utils.device`、`vllm` 和外部 `flash_attn`，并
+  打印实际 Python、包版本和 CUDA 设备；导入失败时不要只补一个缺失包继续跑。
+- C2 的固定入口是 README 中的十批命令：`data/m1/c2_smoke.jsonl`、group 4、
+  seed 42、max prompt 896、max tokens 96、max turns 4、top-k 5。不要因为
+  某个 batch reward 为零而换 seed、删样本、重采样或改 reward/mask。
+- 远程 L40 运行必须输出到新目录，并保留 `console.log`、manifest、每批
+  `c2_steps.jsonl`、checkpoint 和 reload 证据。旧的 WSL 中断目录只能作为失败
+  诊断，不能与新机器的 clean run 合并统计。
+
+### 远程故障优先级
+
+1. 先区分解释器/依赖错误、模型路径错误、Ray 端口错误、CUDA/显存错误和训练
+   correctness 错误；使用 verify 脚本、`nvidia-smi`、manifest 和 traceback，
+   不要靠“再装一个包”猜测。
+2. `rllm.trainer.config` 缺失通常表示用了根目录 `.venv` 或 conda，而不是
+   Hydra 本身缺失。
+3. WSL CUDA IPC 的 `invalid argument` 是已知运行时问题；在原生 Linux L40
+   上先保留默认 IPC 路径，只有实际出现该错误才启用共享内存 workaround。
+4. 任何无 traceback 的长时间无输出都不能写成“训练成功”。先保存 stdout、
+   checkpoint 和状态文件，记录最后一个 global step；必要时终止进程后把运行
+   标为 interrupted/failed，不能改写成 completed。
+
+### 当前 C2 证据边界
+
+截至当前提交，WSL 共享内存 workaround 运行曾实际完成 7/10 个 batch 并落到
+`global_step_7`，之后 WSL 整体无响应，不能判定 C2 通过。下一台原生 Linux L40
+必须重新执行完整十批 run；不要把这次 7-step 中断与完整 C2 proof 拼接。
+
 ## 已解决的调试经验
 
 ### 1. rollout 身份不能只用 task_id

@@ -29,6 +29,15 @@
     "flashinfer-cubin": "0.6.11.post2",
     "flash-attn": "2.8.3"
   },
+  "reproduction": {
+    "requirements": "configs/m1/m1c-requirements-linux.txt",
+    "requirements_lock": "configs/m1/m1c-requirements-linux.lock.txt",
+    "uv_overrides": "configs/m1/m1c-uv-overrides.txt",
+    "bootstrap": "scripts/bootstrap_m1c_uv.sh",
+    "verify": "scripts/verify_m1c_env.py",
+    "install_mode": "uv pip sync <requirements_lock>",
+    "native_linux_profile": "configs/m1/runtime/l40-48g-linux.yaml"
+  },
   "flash_attention_wheel": {
     "filename": "flash_attn-2.8.3+cu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
     "source_url": "https://huggingface.co/spaces/prithivMLmods/Image-to-3D-Video-Asset-Generator/resolve/main/flash_attention_2/flash_attn-2.8.3%2Bcu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",

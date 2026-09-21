@@ -1,0 +1,8 @@
+# M1-C runtime override file for uv.
+#
+# veRL/rLLM currently publish an upstream NumPy constraint that is
+# incompatible with the pinned Torch/vLLM line used by this experiment.  The
+# validated Linux environment uses NumPy 2.3.5; keep this override explicit
+# instead of silently letting uv choose a different stack.
+numpy==2.3.5
+transformers==4.57.6

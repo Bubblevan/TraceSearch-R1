@@ -1,0 +1,42 @@
+# Unvalidated native-Linux profile for a single NVIDIA L40 (48 GiB).
+# Keep the C2 context and algorithm contract unchanged; only the hardware
+# profile name differs from the historical 4090/16-GiB WSL profile.
+profile_name: l40-48g-linux
+validation_label: "unvalidated single-GPU NVIDIA L40 48-GiB Linux setup"
+
+runtime:
+  rollout_engine: vllm
+  gpu_memory_utilization: 0.90
+  cpu_offload_gb: 0
+  enforce_eager: false
+  tensor_model_parallel_size: 1
+  max_model_len: 1024
+  max_prompt_length: 896
+  max_num_batched_tokens: 4096
+
+model:
+  name: Qwen2.5-3B-Instruct
+  lora_rank: 8
+  lora_alpha: 16
+  lora_merge: true
+  attention_implementation: sdpa
+  gradient_checkpointing: true
+
+training:
+  algorithm: grpo
+  learning_rate: 1.0e-6
+  weight_decay: 0.0
+  ppo_epochs: 1
+  kl_beta: 0.0
+  rejection_sampling: false
+  stepwise_advantage: false
+  process_reward: false
+  loss_agg_mode: seq-mean-token-mean
+
+sampling:
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+  presence_penalty: 0.0
+  repetition_penalty: 1.0
+  disable_thinking: true
