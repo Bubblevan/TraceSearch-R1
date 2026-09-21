@@ -153,6 +153,35 @@ def test_live_advantage_parity_reads_step_ids_and_sets_zero_signal_gate(tmp_path
     assert observer.update_gate == "no_learning_signal"
 
 
+def test_live_advantage_parity_uses_backend_epsilon_for_mixed_rewards(tmp_path: Path):
+    observer = RuntimeTrainingObserver(tmp_path, phase="c1")
+    observer.live_mask = {"parity": True}
+    trajectories = [
+        _fake_trajectory("u0", 0.0),
+        _fake_trajectory("u1", 0.0),
+        _fake_trajectory("u2", 1.0),
+        _fake_trajectory("u3", 1.0),
+    ]
+    backend_advantage = 0.999998000004
+    batch = SimpleNamespace(
+        batch={
+            "advantages": [
+                [-backend_advantage] * 6,
+                [-backend_advantage] * 6,
+                [backend_advantage] * 6,
+                [backend_advantage] * 6,
+            ],
+            "response_mask": [[1, 1, 0, 0, 1, 1]] * 4,
+        },
+        non_tensor_batch={"step_ids": ["u0", "u1", "u2", "u3"], "is_pad_step": [False] * 4},
+    )
+    state = SimpleNamespace(backend_batch=batch, trajectory_groups=[SimpleNamespace(trajectories=trajectories)])
+    observer.observe_advantages(state)
+    assert observer.live_advantage["parity"] is True
+    assert observer.live_advantage["groups"][0]["max_abs_error"] == pytest.approx(0.0)
+    assert observer.update_gate is None
+
+
 def test_checkpoint_delta_is_primary_policy_update_evidence(tmp_path: Path):
     torch = pytest.importorskip("torch")
     before = tmp_path / "pre_update" / "actor"

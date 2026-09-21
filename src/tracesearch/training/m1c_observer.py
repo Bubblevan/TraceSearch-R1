@@ -244,7 +244,10 @@ class RuntimeTrainingObserver:
                     backend_by_uid.setdefault(str(step_id), []).append(sum(values) / len(values))
         groups = []
         for group in _groups(state):
-            local = list(compute_group_advantages(group["rewards"]))
+            # rLLM's GRPO path normalizes with epsilon=1e-6.  The live parity
+            # gate must use the same contract; the local helper deliberately
+            # keeps its backend-independent default for other callers.
+            local = list(compute_group_advantages(group["rewards"], epsilon=1e-6))
             backend: list[float | None] = []
             errors: list[float] = []
             row_consistency = True
