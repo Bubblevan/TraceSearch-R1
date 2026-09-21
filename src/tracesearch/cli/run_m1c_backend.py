@@ -1088,6 +1088,7 @@ def run(args: argparse.Namespace) -> int:
             raise RuntimeError(f"C1 proof gate failed with status={status}")
         return 0
     except Exception as exc:
+        failure_status = "backend_failed" if args.phase == "c1" else "failed"
         if config is not None and tasks:
             try:
                 _write_artifacts(
@@ -1098,7 +1099,7 @@ def run(args: argparse.Namespace) -> int:
                     provenance,
                     c0_batch_weight_sync=c0_batch_weight_sync,
                     observer=observer,
-                    status="failed",
+                    status=failure_status,
                     failure=exc,
                 )
             except Exception as artifact_exc:
@@ -1107,7 +1108,7 @@ def run(args: argparse.Namespace) -> int:
             _write_json(output / "backend_manifest.json", {"schema_version": "m1c.backend.v1", "phase": args.phase, "git_dirty": True})
             _write_json(output / "resolved_config.json", {})
             _write_json(output / "failure.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
-        _write_run_status(output, "failed", phase=args.phase, exception=type(exc).__name__)
+        _write_run_status(output, failure_status, phase=args.phase, exception=type(exc).__name__)
         raise
     finally:
         os.environ.pop("TRACESEARCH_M1C_OBSERVER_DIR", None)
