@@ -12,8 +12,10 @@ from tracesearch.cli.run_m1c_backend import (
     _prepare_output,
     _runtime_metrics,
 )
+from tracesearch.data.schema import Action, ActionKind, Step, TerminationReason, Trajectory
 from tracesearch.training.m1c_observer import RuntimeTrainingObserver
 from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
+from tracesearch.training.rllm_workflow import _rllm_termination_value
 
 
 def test_owned_runtime_profile_changes_composed_inputs():
@@ -163,6 +165,33 @@ def test_checkpoint_delta_is_primary_policy_update_evidence(tmp_path: Path):
     assert evidence["evidence_source"] == "checkpoint_delta"
     assert evidence["changed_trainable_tensor_count"] == 1
     assert evidence["nonzero_parameter_updates"] == 1
+
+
+def test_policy_parse_failure_is_trainable_not_backend_fatal():
+    trajectory = Trajectory(
+        question="q",
+        termination_reason=TerminationReason.POLICY_ERROR,
+        steps=[
+            Step(
+                thought="",
+                action=Action(ActionKind.ANSWER, ""),
+                metadata={
+                    "parse_failure_type": "malformed_tag",
+                    "generation_record": {"prompt_ids": [1], "response_ids": [2]},
+                },
+            )
+        ],
+    )
+    assert _rllm_termination_value(trajectory) == "unknown"
+
+
+def test_policy_backend_failure_remains_fatal():
+    trajectory = Trajectory(
+        question="q",
+        termination_reason=TerminationReason.POLICY_ERROR,
+        steps=[Step(thought="", action=Action(ActionKind.ANSWER, ""), metadata={"failure_class": "policy_error"})],
+    )
+    assert _rllm_termination_value(trajectory) == "error"
 
 
 def test_repository_does_not_shadow_external_flash_attn():

@@ -96,6 +96,33 @@ if os.environ.get("TRACESEARCH_M1C_OBSERVER_DIR"):
 _LOG_LOCK = threading.Lock()
 
 
+def _rllm_termination_value(trajectory: Trajectory) -> str:
+    """Map TraceSearch termination without turning parse negatives into backend failures.
+
+    A malformed model action with exact generation provenance is a valid
+    reward-zero policy sample.  rLLM treats ``ERROR`` as an infrastructure
+    failure when ``raise_on_error`` is enabled, so represent that narrow case
+    as ``UNKNOWN`` and preserve the exact TraceSearch reason in metadata.
+    Generation/backend failures and environment failures remain fatal.
+    """
+
+    reason = trajectory.termination_reason
+    if reason is TerminationReason.POLICY_ERROR:
+        parse_failure = any(
+            bool(step.metadata.get("parse_failure_type"))
+            and isinstance(step.metadata.get("generation_record"), dict)
+            for step in trajectory.steps
+        )
+        return "unknown" if parse_failure else "error"
+    return {
+        TerminationReason.ANSWER: "env_done",
+        TerminationReason.MAX_TURNS: "max_turns_exceeded",
+        TerminationReason.TOOL_BUDGET_EXHAUSTED: "max_turns_exceeded",
+        TerminationReason.ENVIRONMENT_ERROR: "error",
+        TerminationReason.FATAL_TOOL_FAILURE: "error",
+    }[reason]
+
+
 class RLLMModelClient:
     """Adapt rLLM's token-in/token-out engine to TraceSearch ``ModelClient``."""
 
@@ -294,16 +321,14 @@ class TraceSearchWorkflow(_RLLMWorkflow):
                 "rollout_id": uid,
                 "sample_index": trajectory.sample_index,
                 "tracesearch_termination": trajectory.termination_reason.value,
+                "parse_failure_types": [
+                    str(step.metadata["parse_failure_type"])
+                    for step in trajectory.steps
+                    if step.metadata.get("parse_failure_type")
+                ],
             },
         )
-        termination = {
-            TerminationReason.ANSWER: "env_done",
-            TerminationReason.MAX_TURNS: "max_turns_exceeded",
-            TerminationReason.TOOL_BUDGET_EXHAUSTED: "max_turns_exceeded",
-            TerminationReason.POLICY_ERROR: "error",
-            TerminationReason.ENVIRONMENT_ERROR: "error",
-            TerminationReason.FATAL_TOOL_FAILURE: "error",
-        }[trajectory.termination_reason]
+        termination = _rllm_termination_value(trajectory)
         return _RLLMEpisode(
             id=uid,
             task=task.policy_view().to_dict(),
@@ -311,7 +336,11 @@ class TraceSearchWorkflow(_RLLMWorkflow):
             is_correct=bool(reward > 0.0),
             trajectories=[rllm_trajectory],
             metrics={"reward": float(reward)},
-            metadata={"task_id": task_id, "sample_index": trajectory.sample_index},
+            metadata={
+                "task_id": task_id,
+                "sample_index": trajectory.sample_index,
+                "tracesearch_termination": trajectory.termination_reason.value,
+            },
         )
 
     def _write_artifact(
