@@ -23,6 +23,14 @@
     "flashinfer-python": "0.6.11.post2",
     "flashinfer-cubin": "0.6.11.post2"
   },
+  "optional_rollout_engines": {
+    "sglang": {
+      "requirements_lock": "configs/m1/sglang-requirements-linux.txt",
+      "package": "sglang==0.5.11",
+      "same_environment_as_pinned_vllm": false,
+      "reason": "SGLang serving dependencies include FlashAttention-4 and a separate Transformers line; keep them out of the pinned M1-C vLLM environment."
+    }
+  },
   "runner_contract": {
     "gpu": "single visible CUDA GPU",
     "vllm_engine": "V1",

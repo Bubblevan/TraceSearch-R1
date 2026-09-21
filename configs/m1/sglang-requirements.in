@@ -1,0 +1,5 @@
+# Linux/WSL-only serving alternative. Install in a separate uv environment.
+# SGLang 0.5.11 matches the current CUDA 13 / Torch 2.11 line, but its
+# FlashAttention-4 and Transformers dependencies must not replace M1-C's
+# pinned vLLM/rLLM/veRL stack.
+sglang==0.5.11

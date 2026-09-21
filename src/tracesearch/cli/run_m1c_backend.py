@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
+    parser.add_argument("--cpu-offload-gb", type=float, default=4.0)
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use eager execution in vLLM (use --no-enforce-eager to benchmark CUDA graphs).",
+    )
     return parser
 
 
@@ -213,7 +220,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     # contract and leaves room for those blocks on a 16 GiB card.
     set_value("actor_rollout_ref.rollout.max_model_len", 1024)
     set_value("actor_rollout_ref.rollout.enable_prefix_caching", False)
-    set_value("actor_rollout_ref.rollout.enforce_eager", True)
+    set_value("actor_rollout_ref.rollout.enforce_eager", args.enforce_eager)
     set_value("actor_rollout_ref.rollout.load_format", "auto")
     set_value("actor_rollout_ref.rollout.free_cache_engine", True)
     # veRL's colocated actor keeps FSDP resident while vLLM starts.  On the
@@ -221,7 +228,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     # leaves enough device memory for at least one KV-cache block.
     set_value(
         "actor_rollout_ref.rollout.engine_kwargs.vllm.cpu_offload_gb",
-        4.0,
+        args.cpu_offload_gb,
         force_add=True,
     )
     set_value("actor_rollout_ref.rollout.val_kwargs.do_sample", True)
@@ -457,7 +464,15 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _write_artifacts(output: Path, args: argparse.Namespace, config: Any, tasks: list[Any], provenance: dict[str, Any]) -> None:
+def _write_artifacts(
+    output: Path,
+    args: argparse.Namespace,
+    config: Any,
+    tasks: list[Any],
+    provenance: dict[str, Any],
+    *,
+    c0_batch_weight_sync: str,
+) -> None:
     from omegaconf import OmegaConf
 
     repo = Path(__file__).resolve().parents[3]
@@ -505,6 +520,11 @@ def _write_artifacts(output: Path, args: argparse.Namespace, config: Any, tasks:
         "group_size": args.group_size,
         "max_turns": args.max_turns,
         "max_tokens": args.max_tokens,
+        "runtime_optimizations": {
+            "c0_batch_end_weight_sync": c0_batch_weight_sync,
+            "cpu_offload_gb": args.cpu_offload_gb,
+            "enforce_eager": args.enforce_eager,
+        },
         "dependency_resolution_note": "rLLM current metadata conflicts with veRL/vLLM numpy constraints; this isolated env uses the explicitly recorded numpy override.",
     }
     _write_json(output / "backend_manifest.json", manifest)
@@ -517,6 +537,7 @@ def _write_artifacts(output: Path, args: argparse.Namespace, config: Any, tasks:
         "requested_optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
         "optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
         "optimizer_steps_source": "configured trainer.total_batches; c0 critic_warmup suppresses actor update",
+        "c0_batch_end_weight_sync": c0_batch_weight_sync,
         "mean_exact_match": summary["mean_exact_match"],
         "group_exact_match_variance": summary["group_exact_match_variance"],
         "zero_variance_groups": summary["group_exact_match_variance"] == 0.0,
@@ -533,6 +554,7 @@ def _write_artifacts(output: Path, args: argparse.Namespace, config: Any, tasks:
                 f"- Project commit: `{manifest['git_commit']}`",
                 f"- Git dirty: `{manifest['git_dirty']}`",
                 f"- Optimizer steps: `{metrics['optimizer_steps']}`",
+                f"- C0 batch-end weight sync: `{c0_batch_weight_sync}`",
                 f"- Rollout slots: `{summary['completed_rollout_slots']}/{summary['denominator']}`",
                 f"- Mean exact match: `{summary['mean_exact_match']}`",
                 f"- Group exact-match variance: `{summary['group_exact_match_variance']}`",
@@ -580,8 +602,23 @@ def run(args: argparse.Namespace) -> int:
             "disable_thinking": True,
         },
     )
+    c0_batch_weight_sync = "not_applicable"
+    if args.phase == "c0":
+        from importlib import import_module
+
+        verl_backend = import_module("rllm.trainer.verl.verl_backend")
+        from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
+
+        c0_batch_weight_sync = install_c0_post_batch_weight_sync_skip(verl_backend)
     trainer.train()
-    _write_artifacts(output, args, config, tasks, provenance)
+    _write_artifacts(
+        output,
+        args,
+        config,
+        tasks,
+        provenance,
+        c0_batch_weight_sync=c0_batch_weight_sync,
+    )
     return 0
 
 

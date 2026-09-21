@@ -23,6 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
+    parser.add_argument("--cpu-offload-gb", type=float, default=4.0)
+    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
@@ -51,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         top_k=args.top_k,
         task_count=args.task_count,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        cpu_offload_gb=args.cpu_offload_gb,
+        enforce_eager=args.enforce_eager,
     )
     return run(backend_args)
 
