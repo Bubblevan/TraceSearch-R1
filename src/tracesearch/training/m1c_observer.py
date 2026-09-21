@@ -340,7 +340,7 @@ class RuntimeTrainingObserver:
                 local_by_uid[str(getattr(trajectory, "uid", ""))] = _trajectory_segments(trajectory)
 
         rows: list[dict[str, Any]] = []
-        segment_indexes: dict[str, int] = {}
+        unmatched_segments = {key: set(range(len(segments))) for key, segments in local_by_uid.items()}
         responses = batch.batch["responses"]
         response_mask = batch.batch["response_mask"]
         attention_mask = batch.batch.get("attention_mask")
@@ -349,9 +349,6 @@ class RuntimeTrainingObserver:
                 continue
             key = str(step_id)
             segments = local_by_uid.get(key, [])
-            segment_index = segment_indexes.get(key, 0)
-            segment_indexes[key] = segment_index + 1
-            expected = segments[segment_index] if segment_index < len(segments) else None
             backend_response = _row(batch, "responses", index)
             backend_mask = _row(batch, "response_mask", index)
             if attention_mask is None:
@@ -363,6 +360,20 @@ class RuntimeTrainingObserver:
             active_positions = [position for position, active in enumerate(response_attention) if bool(active)]
             backend_ids = [int(backend_response[position]) for position in active_positions]
             backend_mask_values = [int(backend_mask[position]) for position in active_positions]
+            candidates = sorted(unmatched_segments.get(key, set()))
+            exact_matches = [
+                candidate
+                for candidate in candidates
+                if segments[candidate]["response_ids"] == backend_ids
+                and segments[candidate]["response_mask"] == backend_mask_values
+            ]
+            # veRL may reorder flattened step rows while retaining only the
+            # rollout-level step_id. Match each row to one unconsumed local
+            # segment by content instead of assuming per-rollout row order.
+            segment_index = exact_matches[0] if exact_matches else (candidates[0] if candidates else None)
+            if segment_index is not None:
+                unmatched_segments[key].discard(segment_index)
+            expected = segments[segment_index] if segment_index is not None else None
             expected_ids = expected["response_ids"] if expected else []
             expected_mask = expected["response_mask"] if expected else []
             mismatch_positions = [

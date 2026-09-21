@@ -136,6 +136,28 @@ def test_live_mask_parity_uses_step_ids_and_excludes_padding():
     ]
 
 
+def test_live_mask_parity_matches_reordered_segments_within_rollout():
+    trajectory = SimpleNamespace(
+        uid="u0",
+        steps=[
+            SimpleNamespace(model_output=SimpleNamespace(prompt_ids=[10], completion_ids=[20, 21])),
+            SimpleNamespace(model_output=SimpleNamespace(prompt_ids=[99], completion_ids=[40, 41, 42])),
+        ],
+    )
+    batch = SimpleNamespace(
+        batch={
+            "responses": [[0, 40, 41, 42], [0, 0, 20, 21]],
+            "response_mask": [[0, 1, 1, 1], [0, 0, 1, 1]],
+            "attention_mask": [[0, 1, 1, 1], [0, 0, 1, 1]],
+        },
+        non_tensor_batch={"step_ids": ["u0", "u0"], "is_pad_step": [False, False]},
+    )
+    state = SimpleNamespace(backend_batch=batch, trajectory_groups=[SimpleNamespace(trajectories=[trajectory])])
+    parity = RuntimeTrainingObserver._live_mask_parity(state)
+    assert parity["parity"] is True
+    assert [row["segment_index"] for row in parity["rows"]] == [1, 0]
+
+
 def test_live_advantage_parity_reads_step_ids_and_sets_zero_signal_gate(tmp_path: Path):
     observer = RuntimeTrainingObserver(tmp_path, phase="c1")
     observer.live_mask = {"parity": True}
