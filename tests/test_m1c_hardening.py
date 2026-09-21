@@ -55,6 +55,17 @@ def test_runtime_counters_are_not_phase_derived(tmp_path: Path):
     assert metrics["observed_optimizer_steps"] is None
 
 
+def test_runtime_counters_read_remote_ray_observer(tmp_path: Path):
+    args = Namespace(phase="c1")
+    (tmp_path / "training_observer.json").write_text(
+        '{"batches": [{"observed_actor_update_calls": 1}]}',
+        encoding="utf-8",
+    )
+    metrics = _runtime_metrics(tmp_path, args, None)
+    assert metrics["observed_actor_update_calls"] == 1
+    assert metrics["observed_optimizer_steps"] == 0
+
+
 def test_repository_does_not_shadow_external_flash_attn():
     repo = Path(__file__).resolve().parents[1]
     shadow_root = repo / "src" / "flash_attn"

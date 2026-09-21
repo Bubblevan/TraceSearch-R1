@@ -595,6 +595,18 @@ def _parameter_evidence(output: Path) -> dict[str, Any]:
 
 def _runtime_metrics(output: Path, args: argparse.Namespace, observer: RuntimeTrainingObserver | None) -> dict[str, Any]:
     batches = observer.records if observer is not None else []
+    # The real ``VerlBackend`` lives in the Ray ``VerlTaskRunner``.  Its
+    # observer therefore writes a durable record from that process instead of
+    # mutating the CLI driver's observer object.  Prefer the in-process view,
+    # but read the remote record when the driver has no batches so counters in
+    # ``metrics.json`` remain runtime-derived and internally consistent.
+    observer_path = output / "training_observer.json"
+    if not batches and observer_path.exists():
+        try:
+            remote = json.loads(observer_path.read_text(encoding="utf-8"))
+            batches = list(remote.get("batches", []))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            batches = []
     parameter_evidence = _parameter_evidence(output)
     observed_actor_update_calls = sum(int(row.get("observed_actor_update_calls", 0)) for row in batches)
     probe_count = int(parameter_evidence["probe_count"])
