@@ -74,8 +74,26 @@ def main(argv: list[str] | None = None) -> int:
             )
         adapter_state = {key: state[key] for key in loaded_lora_keys}
         missing, unexpected = adapter.load_state_dict(adapter_state, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(f"adapter state load was incomplete: missing={len(missing)}, unexpected={len(unexpected)}")
+        # The checkpoint intentionally contains only trainable LoRA tensors;
+        # the frozen base-model tensors are restored from ``--base-model``.
+        # ``load_state_dict`` therefore reports every frozen tensor as missing
+        # even when the adapter itself is complete.  Only LoRA keys are part
+        # of this integrity contract.
+        missing_adapter_lora = sorted(key for key in missing if ".lora_" in key)
+        unexpected_adapter_lora = sorted(key for key in unexpected if ".lora_" in key)
+        result.update(
+            {
+                "adapter_missing_non_lora_tensor_count": sum(".lora_" not in key for key in missing),
+                "adapter_unexpected_non_lora_tensor_count": sum(".lora_" not in key for key in unexpected),
+                "adapter_missing_lora_keys": missing_adapter_lora,
+                "adapter_unexpected_lora_keys": unexpected_adapter_lora,
+            }
+        )
+        if missing_adapter_lora or unexpected_adapter_lora:
+            raise RuntimeError(
+                "adapter LoRA state load was incomplete: "
+                f"missing={len(missing_adapter_lora)}, unexpected={len(unexpected_adapter_lora)}"
+            )
         result["loaded"] = True
         result["adapter_loaded"] = True
         result["adapter_tensor_count"] = len(adapter_state)
