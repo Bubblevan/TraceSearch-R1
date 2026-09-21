@@ -63,11 +63,49 @@ def main(argv: list[str] | None = None) -> int:
         result["adapter_loaded"] = True
         result["adapter_tensor_count"] = len(adapter_state)
 
-        prompt = "Respond with exactly one TraceSearch action and no explanation: <answer>yes</answer>"
-        inputs = tokenizer(prompt, return_tensors="pt")
+        # Use the same chat-template boundary as the live policy.  A bare
+        # completion prompt is not a valid probe for an instruct/chat model:
+        # it can make the model continue the example or emit multiple actions,
+        # producing a parser failure even though the adapter loaded correctly.
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a text search agent. Emit exactly one action per turn using "
+                    "<think>...</think> followed by exactly one of "
+                    "<search>query</search>, <visit>doc_id</visit>, or "
+                    "<answer>final answer</answer>. Do not emit code or other tags. "
+                    "For factual questions, the first turn must search before answering."
+                ),
+            },
+            {"role": "user", "content": "Find one relevant document and emit the first search action."},
+        ]
+        if hasattr(tokenizer, "apply_chat_template"):
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if isinstance(rendered, dict):
+                inputs = rendered
+            else:
+                inputs = {"input_ids": rendered}
+            if "attention_mask" not in inputs:
+                inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+        else:
+            prompt = messages[-1]["content"]
+            inputs = tokenizer(prompt, return_tensors="pt")
         with torch.no_grad():
-            generated = adapter.generate(**inputs, max_new_tokens=24, do_sample=False)
+            generated = adapter.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
         text = tokenizer.decode(generated[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
+        result["generated_text"] = text
         from tracesearch.agent.parser import parse_policy_output
 
         parsed = parse_policy_output(text)
