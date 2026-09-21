@@ -10,14 +10,16 @@ import pytest
 from tracesearch.cli.run_m1c_backend import (
     _apply_runtime_profile,
     _c1_status,
+    _c2_status,
     _checkpoint_delta_evidence,
     _load_tasks,
     _register_dataset,
     _prepare_output,
     _runtime_metrics,
+    _validate_c2_schedule,
 )
 from tracesearch.data.schema import Action, ActionKind, Step, TerminationReason, Trajectory
-from tracesearch.training.m1c_observer import RuntimeTrainingObserver
+from tracesearch.training.m1c_observer import M1CProofError, RuntimeTrainingObserver
 from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
 from tracesearch.training.rllm_workflow import _rllm_termination_value
 from tracesearch.training.rllm_workflow import TraceSearchWorkflow
@@ -74,6 +76,57 @@ def test_c1_status_requires_natural_signal_and_parameter_delta(tmp_path: Path):
         "update_gates": [],
     }
     assert _c1_status("c1", [{"group_exact_match_variance": 0.25}], metrics) == "completed"
+
+
+def test_proof_status_exception_preserves_explicit_status():
+    error = M1CProofError("reload_failed", "reload probe failed")
+    assert error.status == "reload_failed"
+
+
+def test_c2_zero_variance_does_not_suppress_normal_update(tmp_path: Path):
+    observer = RuntimeTrainingObserver(tmp_path, phase="c2")
+    observer.live_mask = {"parity": True}
+    trajectories = [_fake_trajectory("u0", 1.0), _fake_trajectory("u1", 1.0)]
+    batch = SimpleNamespace(
+        batch={
+            "advantages": [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]],
+            "response_mask": [[1, 1, 0, 0, 1, 1], [1, 1, 0, 0, 1, 1]],
+        },
+        non_tensor_batch={"step_ids": ["u0", "u1"], "is_pad_step": [False, False]},
+    )
+    state = SimpleNamespace(backend_batch=batch, trajectory_groups=[SimpleNamespace(trajectories=trajectories)])
+    observer.observe_advantages(state)
+    assert observer.update_gate is None
+    assert observer.should_skip_actor_update() is False
+
+
+def test_c2_fixture_excludes_calibration_tasks_and_hides_gold_fields():
+    tasks, _ = _load_tasks(Path("data/m1/c2_smoke.jsonl"), task_count=0)
+    assert [task.task_id for task in tasks] == [f"task-{index:03d}" for index in range(1, 11)]
+    assert all(task.policy_view().answers == [] for task in tasks)
+    assert all(task.policy_view().gold_evidence_ids == [] for task in tasks)
+
+
+def test_c2_schedule_validation_matches_pinned_seeded_shuffle(tmp_path: Path):
+    tasks, _ = _load_tasks(Path("data/m1/c2_smoke.jsonl"), task_count=0)
+    import random
+
+    order = [task.task_id for task in tasks]
+    random.Random(42).shuffle(order)
+    rows = []
+    for step, task_id in enumerate(order, start=1):
+        rows.append(
+            {
+                "global_step": step,
+                "task_id": task_id,
+                "rllm_group_id": f"{task_id}:search",
+                "sample_indices": [0, 1, 2, 3],
+                "derived_sampling_seeds": [{"sample_index": index, "step_seeds": [1, 2, 3, 4]} for index in range(4)],
+            }
+        )
+    (tmp_path / "c2_task_schedule.json").write_text(json.dumps(rows), encoding="utf-8")
+    result = _validate_c2_schedule(tmp_path, tasks, 4, 42, 4)
+    assert result["valid"] is True
 
 
 def test_probe_does_not_claim_optimizer_step_or_policy_update(tmp_path: Path):

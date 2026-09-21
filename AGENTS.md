@@ -1,13 +1,14 @@
 # TraceSearch-R1 Agent Notes
 
-这份文档记录进入 M1-C1.1 期间已经实际遇到并解决的结构性问题、验证方式和排查结论。它是仓库协作约定的一部分，不是新的训练方案。
+这份文档记录进入 M1-C2 期间已经实际遇到并解决的结构性问题、验证方式和排查结论。它是仓库协作约定的一部分，不是新的训练方案。
 
 ## 当前边界
 
-- 当前工作范围是 M0/M1-C1.1 的 rollout、后端证据和单次 vanilla-GRPO proof。
-- 不要在没有新的 TRD 或明确授权的情况下开始 C2、训练 sweep、reward 改造、token mask 改造或自动重试实验。
+- 当前工作范围是 M1-C2 的十批 vanilla-GRPO stability smoke；M1-C1/C1.1/C1.2 已完成并作为前置证据保留。
+- C2 只验证固定 rLLM/veRL/vLLM 路径的数值和基础设施稳定性，不是 benchmark，也不产生模型能力结论。
+- 不要在没有新的 TRD 或明确授权的情况下开始 M1-D、M2、训练 sweep、reward 改造、token mask 改造或自动重试实验。
 - 当前仓库直接在 `main` 上工作。实验结果必须记录 commit、dirty 状态、运行时配置、模型路径和完整命令。
-- C1.1 的安全停止条件优先于“把程序跑完”：如果 group 没有 reward variance，必须报告 `no_learning_signal`，跳过 actor update 和权重同步，不得靠换 seed、换 task 或扩大采样偷偷制造学习信号。
+- C1 的安全停止条件优先于“把程序跑完”：C1 的零信号 gate 可以停止单次 proof；C2 不得复用这个 gate，零方差 batch 仍必须进入正常 vanilla-GRPO 训练循环并被记录。
 
 ## 已解决的调试经验
 
@@ -86,3 +87,22 @@ clean WSL ext4 checkout、固定 uv 环境、明确的 vLLM/SGLang backend、`gi
 - actor update call、optimizer step、pre/post checkpoint delta、reload evidence。
 - 若为 `no_learning_signal`，保留原始证据并停止，不用重采样替换失败或零 reward 样本。
 
+## M1-C2 执行约定
+
+- C2 的数据源是 `data/m1/c2_smoke.jsonl`，只由 M0 的 `task-001` 到
+  `task-010` 机械转换而来；它是 integration/stability fixture，不是
+  benchmark 或研究 train/dev/test 数据。
+- pinned rLLM 的 task dataloader 使用 `shuffle=True` 和
+  `random.Random(seed + epoch)`。实际 task 顺序必须写入
+  `c2_task_schedule.json`，并与同 seed 的预期 permutation 校验；不能按
+  文件顺序臆测，也不能按 reward 结果手工挑顺序。
+- C2 每个 batch 都必须通过 live mask parity 和 live advantage parity。
+  parity 失败是 correctness failure，必须在下一次 actor update 前停止；
+  zero-variance 只是算法信号为零，不等价于 instrumentation failure，不能
+  用 rejection sampling 替换，也不能静默跳过 optimizer/update_weights。
+- C1/C2 proof gate 失败必须保留原始状态（例如 `reload_failed`、
+  `parity_failed`），不能在 generic exception cleanup 中覆盖成
+  `backend_failed`。
+- C2 的最终结论只能是固定 vanilla-GRPO 路径在有限十批 fixture 上的
+  数值/基础设施稳定性；不得写成 benchmark improvement、收敛、能力提升或
+  泛化结论。

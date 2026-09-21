@@ -16,7 +16,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tracesearch.agent.llm import SAMPLING_SEED_SCHEME, sampling_seed_table
 from tracesearch.training.grpo import compute_group_advantages
+
+
+class M1CProofError(RuntimeError):
+    """A typed safety/proof failure whose status must survive runner cleanup."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _jsonable(value: Any) -> Any:
@@ -57,11 +66,14 @@ def _groups(state: Any) -> list[dict[str, Any]]:
         trajectories = list(getattr(group, "trajectories", []) or [])
         rewards = [float(getattr(item, "reward", 0.0) or 0.0) for item in trajectories]
         metadata = [getattr(item, "metadata", None) or {} for item in trajectories]
+        details = [_trajectory_details(item) for item in trajectories]
         rows.append(
             {
                 "group_id": str(getattr(group, "group_id", "")),
                 "rollout_ids": [str(getattr(item, "uid", "")) for item in trajectories],
                 "task_ids": [str(item.get("task_id", "")) for item in metadata],
+                "sample_indices": [detail["sample_index"] for detail in details],
+                "rollouts": details,
                 "rewards": rewards,
                 "reward_mean": sum(rewards) / len(rewards) if rewards else 0.0,
                 "reward_std": (sum((reward - (sum(rewards) / len(rewards))) ** 2 for reward in rewards) / len(rewards)) ** 0.5 if rewards else 0.0,
@@ -124,6 +136,95 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+def _contains_nonfinite(value: Any) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return False
+    if isinstance(value, (int, float)):
+        return not math.isfinite(float(value))
+    if hasattr(value, "detach"):
+        try:
+            tensor = value.detach()
+            return not bool(tensor.isfinite().all().item())
+        except Exception:
+            return True
+    if isinstance(value, dict):
+        return any(_contains_nonfinite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite(item) for item in value)
+    return False
+
+
+def _action_kind(step: Any) -> str | None:
+    action = getattr(step, "action", None)
+    if isinstance(action, dict):
+        value = action.get("kind")
+    else:
+        value = getattr(action, "kind", action)
+    if value is None:
+        return None
+    return str(getattr(value, "value", value)).casefold()
+
+
+def _sample_index(trajectory: Any) -> int | None:
+    metadata = getattr(trajectory, "metadata", None) or {}
+    value = metadata.get("sample_index")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    uid = str(getattr(trajectory, "uid", ""))
+    if ":" in uid:
+        try:
+            return int(uid.rsplit(":", 1)[1])
+        except ValueError:
+            pass
+    return None
+
+
+def _trajectory_details(trajectory: Any) -> dict[str, Any]:
+    metadata = getattr(trajectory, "metadata", None) or {}
+    steps = list(getattr(trajectory, "steps", []) or [])
+    prompt_counts: list[int] = []
+    generated_counts: list[int] = []
+    has_complete_generation_ids = True
+    for step in steps:
+        model_output = getattr(step, "model_output", None)
+        prompt_ids = getattr(model_output, "prompt_ids", None) if model_output is not None else None
+        completion_ids = getattr(model_output, "completion_ids", None) if model_output is not None else None
+        if prompt_ids is None or completion_ids is None:
+            has_complete_generation_ids = False
+        else:
+            prompt_counts.append(len(_as_list(prompt_ids)))
+            generated_counts.append(len(_as_list(completion_ids)))
+    segments = _trajectory_segments(trajectory)
+    observation_growth: int | None = None
+    if has_complete_generation_ids and len(segments) == 1:
+        observation_growth = sum(int(item) for boundary in segments[0]["step_boundaries"] for item in [boundary["observation_length"]])
+    kinds = [_action_kind(step) for step in steps]
+    backend_reasons = [
+        str(reason)
+        for reason in metadata.get("backend_termination_reasons", [])
+        if reason
+    ]
+    termination = metadata.get("tracesearch_termination") or metadata.get("termination_reason")
+    if termination is not None:
+        termination = str(getattr(termination, "value", termination))
+    return {
+        "rollout_id": str(getattr(trajectory, "uid", "")),
+        "sample_index": _sample_index(trajectory),
+        "search_count": sum(kind == "search" for kind in kinds),
+        "visit_count": sum(kind == "visit" for kind in kinds),
+        "turn_count": len(steps),
+        "final_answer_status": bool(kinds and kinds[-1] == "answer"),
+        "termination_reason": termination,
+        "backend_termination_reasons": backend_reasons,
+        "max_prompt_tokens": max(prompt_counts) if prompt_counts else None,
+        "generated_token_count": sum(generated_counts) if has_complete_generation_ids else None,
+        "observation_token_growth": observation_growth,
+    }
+
+
 def _trajectory_segments(trajectory: Any) -> list[dict[str, Any]]:
     """Reconstruct the pinned rLLM cumulative response representation."""
 
@@ -171,9 +272,18 @@ def _trajectory_segments(trajectory: Any) -> list[dict[str, Any]]:
 class RuntimeTrainingObserver:
     """Collect one durable JSON record per real training batch."""
 
-    def __init__(self, output_dir: str | Path, *, phase: str) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        phase: str,
+        base_seed: int = 42,
+        max_turns: int = 4,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.phase = phase
+        self.base_seed = int(base_seed)
+        self.max_turns = int(max_turns)
         self.records: list[dict[str, Any]] = []
         self.actor_update_calls = 0
         self.parameter_probe_files: set[str] = set()
@@ -182,6 +292,20 @@ class RuntimeTrainingObserver:
         self.logprob_diagnostics: list[dict[str, Any]] = []
         self.update_gate: str | None = None
         self.pre_update_snapshot: str | None = None
+        self.numerical_error_count = 0
+
+    def _safety_abort(self, status: str, message: str, *, state: Any | None = None) -> None:
+        self.numerical_error_count += int(status == "backend_failed")
+        _write_json(
+            self.output_dir / "c2_failure.json",
+            {
+                "status": status,
+                "message": message,
+                "global_step": int(getattr(state, "global_step", 0)) if state is not None else None,
+                "phase": self.phase,
+            },
+        )
+        raise M1CProofError(status, message)
 
     def note_actor_update(self) -> None:
         self.actor_update_calls += 1
@@ -192,7 +316,7 @@ class RuntimeTrainingObserver:
     def capture_pre_update(self, backend: Any, trainer_state: Any) -> None:
         """Save a real actor-worker snapshot only after both parity gates pass."""
 
-        if self.phase != "c1" or self.update_gate is not None or self.pre_update_snapshot is not None:
+        if self.phase not in {"c1", "c2"} or self.update_gate is not None or self.pre_update_snapshot is not None:
             return
         target = self.output_dir / "pre_update" / "actor"
         target.mkdir(parents=True, exist_ok=True)
@@ -203,6 +327,8 @@ class RuntimeTrainingObserver:
                 max_ckpt_to_keep=1,
             )
         except Exception as exc:
+            if self.phase == "c2":
+                self._safety_abort("update_failed", f"unable to save initial policy snapshot: {type(exc).__name__}: {exc}", state=trainer_state)
             self.update_gate = "update_failed"
             _write_json(
                 self.output_dir / "pre_update_error.json",
@@ -217,6 +343,8 @@ class RuntimeTrainingObserver:
             return
         old = _masked_values(batch, "old_log_probs")
         rollout = _masked_values(batch, "rollout_log_probs")
+        if _contains_nonfinite(old) or _contains_nonfinite(rollout):
+            self._safety_abort("backend_failed", "NaN/Inf detected in rollout or old log-probabilities", state=state)
         if old and rollout and len(old) == len(rollout):
             diffs = [left - right for left, right in zip(old, rollout, strict=True)]
             mean = statistics.mean(diffs)
@@ -245,6 +373,8 @@ class RuntimeTrainingObserver:
             _write_json(self.output_dir / "rollout_logprob_diagnostics.json", {"records": self.logprob_diagnostics})
         self.live_mask = self._live_mask_parity(state)
         _write_json(self.output_dir / "live_mask_parity.json", self.live_mask)
+        if self.phase == "c2" and not self.live_mask.get("parity"):
+            self._safety_abort("parity_failed", "live mask parity failed before the C2 actor update", state=state)
 
     def observe_advantages(self, state: Any) -> None:
         batch = getattr(state, "backend_batch", None)
@@ -252,6 +382,8 @@ class RuntimeTrainingObserver:
             return
         advantage = batch.batch.get("advantages") if hasattr(batch, "batch") else None
         mask = batch.batch.get("response_mask") if hasattr(batch, "batch") else None
+        if _contains_nonfinite(advantage):
+            self._safety_abort("backend_failed", "NaN/Inf detected in backend advantages", state=state)
         step_ids = _non_tensor_rows(batch, "step_ids")
         is_pad = _non_tensor_rows(batch, "is_pad_step")
         backend_by_uid: dict[str, list[float]] = {}
@@ -295,6 +427,8 @@ class RuntimeTrainingObserver:
             )
         self.live_advantage = {"groups": groups, "parity": bool(groups) and all(item["parity"] for item in groups), "tolerance": 1e-6}
         _write_json(self.output_dir / "live_advantage_parity.json", self.live_advantage)
+        if self.phase == "c2" and not self.live_advantage["parity"]:
+            self._safety_abort("parity_failed", "live advantage parity failed before the C2 actor update", state=state)
         active_advantages = [value for group in groups for value in group["rllm_advantages"] if value is not None]
         if self.phase == "c1":
             if not self.live_mask or not self.live_mask.get("parity") or not self.live_advantage["parity"]:
@@ -309,16 +443,18 @@ class RuntimeTrainingObserver:
         probe_files = sorted(self.output_dir.glob("parameter_probe/actor_update_*.json"))
         self.parameter_probe_files.update(str(path) for path in probe_files)
         normalized = {
-            "actor_loss": self._first_metric(metrics, ("actor/loss", "actor/loss/mean", "loss")),
+            "actor_loss": self._first_metric(metrics, ("actor/loss", "actor/loss/mean", "actor/pg_loss", "loss")),
             "grad_norm": self._first_metric(metrics, ("actor/grad_norm", "grad_norm")),
             "learning_rate": self._first_metric(metrics, ("actor/lr", "actor/learning_rate", "lr")),
-            "clip_fraction": self._first_metric(metrics, ("actor/clipfrac", "actor/clip_fraction")),
+            "clip_fraction": self._first_metric(metrics, ("actor/clipfrac", "actor/pg_clipfrac", "actor/clip_fraction")),
             "entropy": self._first_metric(metrics, ("actor/entropy", "entropy")),
-            "approx_kl": self._first_metric(metrics, ("actor/approx_kl", "approx_kl", "policy/approx_kl")),
+            "approx_kl": self._first_metric(metrics, ("actor/approx_kl", "actor/ppo_kl", "approx_kl", "policy/approx_kl")),
             "response_length": self._first_metric(metrics, ("response_length/mean", "response_length")),
             "active_response_tokens": self._first_metric(metrics, ("response_length/mean", "response_length")),
             "rollout_throughput": self._first_metric(metrics, ("throughput/rollout", "perf/throughput", "throughput")),
         }
+        if _contains_nonfinite(normalized):
+            self._safety_abort("backend_failed", "NaN/Inf detected in actor metrics or gradient norm", state=state)
         record = {
             "global_step": int(getattr(state, "global_step", 0)),
             "groups": groups,
@@ -337,6 +473,8 @@ class RuntimeTrainingObserver:
         }
         self.records.append(record)
         _write_json(self.output_dir / "training_observer.json", {"phase": self.phase, "batches": self.records})
+        if self.phase == "c2":
+            self._write_c2_step_artifacts(state, groups, normalized, timing)
         self.actor_update_calls = 0
 
     @staticmethod
@@ -345,6 +483,129 @@ class RuntimeTrainingObserver:
             if name in metrics:
                 return _jsonable(metrics[name])
         return None
+
+    def _write_c2_step_artifacts(
+        self,
+        state: Any,
+        groups: list[dict[str, Any]],
+        normalized: dict[str, Any],
+        timing: dict[str, Any],
+    ) -> None:
+        """Persist one schedule row and one complete C2 batch evidence row."""
+
+        global_step = int(getattr(state, "global_step", 0))
+        schedule_rows: list[dict[str, Any]] = []
+        step_groups: list[dict[str, Any]] = []
+        for group in groups:
+            task_ids = [item for item in group.get("task_ids", []) if item]
+            task_id = str(task_ids[0] if task_ids else str(group.get("group_id", "")).split(":", 1)[0])
+            sample_indices = [int(value) for value in group.get("sample_indices", []) if value is not None]
+            schedule_rows.append(
+                {
+                    "global_step": global_step,
+                    "task_id": task_id,
+                    "rllm_group_id": group.get("group_id"),
+                    "sample_indices": sample_indices,
+                    "derived_sampling_seeds": [
+                        {
+                            "sample_index": sample_index,
+                            "step_seeds": [
+                                row["derived_sampling_seed"]
+                                for row in sampling_seed_table(
+                                    task_id,
+                                    max(sample_indices, default=-1) + 1,
+                                    self.max_turns,
+                                    base_seed=self.base_seed,
+                                )
+                                if row["sample_index"] == sample_index
+                            ],
+                        }
+                        for sample_index in sorted(sample_indices)
+                    ],
+                    "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
+                }
+            )
+            termination_distribution: dict[str, int] = {}
+            for rollout in group.get("rollouts", []):
+                reason = str(rollout.get("termination_reason") or "unknown")
+                termination_distribution[reason] = termination_distribution.get(reason, 0) + 1
+            parity_group = next(
+                (
+                    item
+                    for item in (self.live_advantage or {}).get("groups", [])
+                    if item.get("group_id") == group.get("group_id")
+                ),
+            )
+            step_groups.append(
+                {
+                    "task_id": task_id,
+                    "rllm_group_id": group.get("group_id"),
+                    "rollout_ids": list(group.get("rollout_ids", [])),
+                    "sample_indices": sample_indices,
+                    "rewards": list(group.get("rewards", [])),
+                    "reward_mean": group.get("reward_mean"),
+                    "reward_variance": group.get("group_exact_match_variance"),
+                    "zero_variance": bool(group.get("zero_variance")),
+                    "tracesearch_advantages": parity_group.get("tracesearch_advantages", []) if parity_group else [],
+                    "rllm_advantages": parity_group.get("rllm_advantages", []) if parity_group else [],
+                    "max_advantage_parity_error": parity_group.get("max_abs_error") if parity_group else None,
+                    "live_mask_parity": bool((self.live_mask or {}).get("parity")),
+                    "live_advantage_parity": bool((self.live_advantage or {}).get("parity")),
+                    "termination_distribution": termination_distribution,
+                    "rollouts": list(group.get("rollouts", [])),
+                }
+            )
+
+        for row in schedule_rows:
+            existing = [item for item in self._read_json("c2_task_schedule.json") if item.get("global_step") == row["global_step"]]
+            if not existing:
+                self._append_json("c2_task_schedule.json", row)
+        step_record = {
+            "global_step": global_step,
+            "groups": step_groups,
+            "normalized_backend_metrics": normalized,
+            "raw_backend_metrics": _jsonable(getattr(state, "metrics", {}) or {}),
+            "rollout_logprob_diagnostics": self.logprob_diagnostics[-1] if self.logprob_diagnostics else None,
+            "timings": _jsonable(timing),
+            "update_actor_s": timing.get("update_actor"),
+            "update_weights_s": timing.get("update_weights"),
+            "checkpoint_save_s": timing.get("save_checkpoint"),
+            "total_step_s": timing.get("step"),
+            "actor_update_calls": self.records[-1]["observed_actor_update_calls"] if self.records else 0,
+        }
+        self._append_jsonl("c2_steps.jsonl", step_record)
+
+    def _read_jsonl(self, name: str) -> list[dict[str, Any]]:
+        path = self.output_dir / name
+        if not path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        rows.append(value)
+        return rows
+
+    def _append_json(self, name: str, value: dict[str, Any]) -> None:
+        _write_json(self.output_dir / name, self._read_json(name) + [value])
+
+    def _read_json(self, name: str) -> list[dict[str, Any]]:
+        path = self.output_dir / name
+        if not path.exists():
+            return []
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return value if isinstance(value, list) else []
+
+    def _append_jsonl(self, name: str, value: dict[str, Any]) -> None:
+        path = self.output_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
     @staticmethod
     def _live_mask_parity(state: Any) -> dict[str, Any]:

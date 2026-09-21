@@ -55,9 +55,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         state_path = actor / "model_world_size_1_rank_0.pt"
         state = torch.load(state_path, map_location="cpu", weights_only=True)
-        adapter_state = {key: value for key, value in state.items() if ".lora_" in key}
+        expected_lora_keys = sorted(key for key in adapter.state_dict() if ".lora_" in key)
+        loaded_lora_keys = sorted(key for key in state if ".lora_" in key)
+        missing_lora_keys = sorted(set(expected_lora_keys) - set(loaded_lora_keys))
+        unexpected_lora_keys = sorted(set(loaded_lora_keys) - set(expected_lora_keys))
+        result.update(
+            {
+                "expected_lora_tensor_count": len(expected_lora_keys),
+                "loaded_lora_tensor_count": len(loaded_lora_keys),
+                "missing_lora_keys": missing_lora_keys,
+                "unexpected_lora_keys": unexpected_lora_keys,
+            }
+        )
+        if missing_lora_keys or unexpected_lora_keys:
+            raise RuntimeError(
+                "adapter key set mismatch: "
+                f"missing={len(missing_lora_keys)}, unexpected={len(unexpected_lora_keys)}"
+            )
+        adapter_state = {key: state[key] for key in loaded_lora_keys}
         missing, unexpected = adapter.load_state_dict(adapter_state, strict=False)
-        if not adapter_state or unexpected:
+        if missing or unexpected:
             raise RuntimeError(f"adapter state load was incomplete: missing={len(missing)}, unexpected={len(unexpected)}")
         result["loaded"] = True
         result["adapter_loaded"] = True

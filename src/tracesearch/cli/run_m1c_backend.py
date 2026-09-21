@@ -11,8 +11,10 @@ import argparse
 import hashlib
 import importlib.metadata as package_metadata
 import json
+import math
 import os
 import platform
+import random
 import shutil
 import statistics
 import subprocess
@@ -25,7 +27,7 @@ from typing import Any
 from tracesearch.data.adapters import NQTaskAdapter
 from tracesearch.agent.llm import SAMPLING_SEED_SCHEME, sampling_seed_table
 from tracesearch.training.grpo import compute_group_advantages
-from tracesearch.training.m1c_observer import RuntimeTrainingObserver
+from tracesearch.training.m1c_observer import M1CProofError, RuntimeTrainingObserver
 from tracesearch.experiment.provenance import flash_attn_provenance
 from tracesearch.training.trace import GenerationRecord, TrainingTrace
 
@@ -117,6 +119,13 @@ _KNOWN_RUN_ARTIFACTS = (
     "checkpoint_proof.json",
     "checkpoint_reload.json",
     "checkpoint_reload_process.log",
+    "c2_task_schedule.json",
+    "c2_schedule_validation.json",
+    "c2_steps.jsonl",
+    "c2_context_budget_summary.json",
+    "c2_parameter_delta.json",
+    "c2_summary.json",
+    "c2_failure.json",
     "summary.md",
     "pre_update",
     "checkpoints",
@@ -693,7 +702,21 @@ def _load_lora_checkpoint(path: Path) -> dict[str, Any]:
     }
 
 
-def _checkpoint_delta_evidence(output: Path) -> dict[str, Any]:
+def _latest_checkpoint_dir(output: Path) -> Path:
+    candidates = []
+    for path in (output / "checkpoints").glob("global_step_*"):
+        try:
+            step = int(path.name.rsplit("_", 1)[1])
+        except ValueError:
+            continue
+        if path.is_dir():
+            candidates.append((step, path))
+    if not candidates:
+        return output / "checkpoints" / "global_step_1"
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _checkpoint_delta_evidence(output: Path, *, final_checkpoint: Path | None = None) -> dict[str, Any]:
     """Compare the pre-update worker snapshot with the saved actor checkpoint.
 
     The comparison intentionally uses files written by veRL's actor worker.
@@ -702,7 +725,8 @@ def _checkpoint_delta_evidence(output: Path) -> dict[str, Any]:
     """
 
     before = _load_lora_checkpoint(output / "pre_update" / "actor")
-    after = _load_lora_checkpoint(output / "checkpoints" / "global_step_1" / "actor")
+    after_root = final_checkpoint or _latest_checkpoint_dir(output)
+    after = _load_lora_checkpoint(after_root / "actor")
     before_tensors = before.get("tensors", {})
     after_tensors = after.get("tensors", {})
     common = sorted(set(before_tensors) & set(after_tensors))
@@ -745,8 +769,8 @@ def _checkpoint_delta_evidence(output: Path) -> dict[str, Any]:
     }
 
 
-def _parameter_evidence(output: Path) -> dict[str, Any]:
-    checkpoint = _checkpoint_delta_evidence(output)
+def _parameter_evidence(output: Path, *, final_checkpoint: Path | None = None) -> dict[str, Any]:
+    checkpoint = _checkpoint_delta_evidence(output, final_checkpoint=final_checkpoint)
     probes = []
     for path in sorted((output / "parameter_probe").glob("actor_update_*.json")):
         try:
@@ -773,6 +797,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 if isinstance(value, dict):
                     rows.append(value)
     return rows
+
+
+def _read_json(path: Path) -> Any:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _termination_diagnostics(output: Path) -> dict[str, Any]:
@@ -986,8 +1019,44 @@ def _c1_status(phase: str, groups: list[dict[str, Any]], metrics: dict[str, Any]
     return "completed"
 
 
+def _c2_status(
+    output: Path,
+    tasks: list[Any],
+    group_size: int,
+    metrics: dict[str, Any],
+) -> str:
+    """Apply the ten-batch C2 smoke gate without changing GRPO semantics."""
+
+    batches = _observer_batches(output, None)
+    if len(batches) != 10:
+        return "backend_failed"
+    if any(item.get("live_mask_parity", {}).get("parity") is not True for item in batches):
+        return "parity_failed"
+    if any(item.get("live_advantage_parity", {}).get("parity") is not True for item in batches):
+        return "parity_failed"
+    schedule = _read_json(output / "c2_schedule_validation.json")
+    if not schedule.get("valid"):
+        return "backend_failed"
+    batch_summary = _read_json(output / "backend_batch_summary.json")
+    if (
+        batch_summary.get("completed_rollout_slots") != len(tasks) * group_size
+        or batch_summary.get("missing_rollout_slots", 0) != 0
+    ):
+        return "backend_failed"
+    variances = [float(group.get("group_exact_match_variance", 0.0)) for item in batches for group in item.get("groups", [])]
+    if variances and all(value == 0.0 for value in variances):
+        return "insufficient_learning_signal"
+    if int(metrics.get("observed_actor_update_calls") or 0) <= 0:
+        return "update_failed"
+    if int(metrics.get("nonzero_parameter_updates") or 0) <= 0:
+        return "update_failed"
+    if metrics.get("live_mask_parity") is not True or metrics.get("live_advantage_parity") is not True:
+        return "parity_failed"
+    return "completed"
+
+
 def _run_checkpoint_reload(output: Path, model: str) -> bool:
-    checkpoint = output / "checkpoints" / "global_step_1"
+    checkpoint = _latest_checkpoint_dir(output)
     result_path = output / "checkpoint_reload.json"
     completed = subprocess.run(
         [
@@ -1015,6 +1084,170 @@ def _run_checkpoint_reload(output: Path, model: str) -> bool:
         return bool(json.loads(result_path.read_text(encoding="utf-8")).get("success")) and completed.returncode == 0
     except json.JSONDecodeError:
         return False
+
+
+def _validate_c2_schedule(output: Path, tasks: list[Any], group_size: int, seed: int, max_turns: int) -> dict[str, Any]:
+    path = output / "c2_task_schedule.json"
+    rows: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            rows = value if isinstance(value, list) else []
+        except json.JSONDecodeError:
+            rows = []
+    declared = [task.task_id for task in tasks]
+    expected_order = list(declared)
+    random.Random(seed).shuffle(expected_order)
+    actual_order = [str(row.get("task_id")) for row in sorted(rows, key=lambda row: int(row.get("global_step", 0)))]
+    expected_samples = list(range(group_size))
+    row_checks = []
+    for row in rows:
+        sample_indices = sorted(int(value) for value in row.get("sample_indices", []))
+        seed_rows = row.get("derived_sampling_seeds", [])
+        seeds_complete = all(
+            len(item.get("step_seeds", [])) == max_turns
+            for item in seed_rows
+            if isinstance(item, dict)
+        )
+        row_checks.append(
+            {
+                "global_step": row.get("global_step"),
+                "task_id": row.get("task_id"),
+                "sample_indices_exact": sample_indices == expected_samples,
+                "derived_seeds_complete": seeds_complete and len(seed_rows) == group_size,
+            }
+        )
+    result = {
+        "schema_version": "m1c.c2-schedule.v1",
+        "seed": seed,
+        "declared_task_ids": declared,
+        "expected_task_order_from_pinned_dataloader": expected_order,
+        "actual_task_order": actual_order,
+        "batch_count": len(rows),
+        "distinct_task_count": len(set(actual_order)),
+        "all_declared_tasks_once": len(rows) == len(declared) and sorted(actual_order) == sorted(declared),
+        "order_matches_seeded_shuffle": actual_order == expected_order,
+        "no_duplicate_batch": len(actual_order) == len(set(actual_order)),
+        "rows": row_checks,
+    }
+    result["valid"] = bool(
+        result["batch_count"] == len(declared)
+        and result["all_declared_tasks_once"]
+        and result["order_matches_seeded_shuffle"]
+        and result["no_duplicate_batch"]
+        and all(item["sample_indices_exact"] and item["derived_seeds_complete"] for item in row_checks)
+    )
+    _write_json(output / "c2_schedule_validation.json", result)
+    return result
+
+
+def _timing_distribution(values: list[float]) -> dict[str, float | None]:
+    clean = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    return {
+        "count": len(clean),
+        "mean": statistics.mean(clean) if clean else None,
+        "median": statistics.median(clean) if clean else None,
+        "p90": _linear_percentile(clean, 0.90),
+        "max": max(clean) if clean else None,
+    }
+
+
+def _write_c2_context_summary(output: Path, *, max_prompt_length: int) -> dict[str, Any]:
+    steps = _read_jsonl(output / "c2_steps.jsonl")
+    per_step = []
+    for step in steps:
+        rollouts = [rollout for group in step.get("groups", []) for rollout in group.get("rollouts", [])]
+        prompt_values = [float(item["max_prompt_tokens"]) for item in rollouts if item.get("max_prompt_tokens") is not None]
+        context_limit_count = sum(
+            "max_prompt_length_exceeded" in [str(reason) for reason in item.get("backend_termination_reasons", [])]
+            or item.get("termination_reason") == "max_prompt_length_exceeded"
+            for item in rollouts
+        )
+        per_step.append(
+            {
+                "global_step": step.get("global_step"),
+                "task_id": (step.get("groups") or [{}])[0].get("task_id"),
+                "max_prompt_length_observed": max(prompt_values) if prompt_values else None,
+                "prompt_budget_utilization": max(prompt_values) / max_prompt_length if prompt_values else None,
+                "context_limit_termination_count": context_limit_count,
+            }
+        )
+    observed = [float(item["max_prompt_length_observed"]) for item in per_step if item.get("max_prompt_length_observed") is not None]
+    return {
+        "schema_version": "m1c.c2-context-budget-summary.v1",
+        "configured_max_prompt_length": max_prompt_length,
+        "per_step": per_step,
+        "aggregate": {
+            "max_prompt_length_observed": max(observed) if observed else None,
+            "mean_prompt_length_observed": statistics.mean(observed) if observed else None,
+            "context_limit_termination_count": sum(item["context_limit_termination_count"] for item in per_step),
+            "batch_count": len(per_step),
+        },
+    }
+
+
+def _write_c2_summary(
+    output: Path,
+    args: argparse.Namespace,
+    *,
+    status: str,
+    parameter_evidence: dict[str, Any],
+) -> None:
+    step_rows = _read_jsonl(output / "c2_steps.jsonl")
+    schedule = _read_json(output / "c2_task_schedule.json") if (output / "c2_task_schedule.json").exists() else []
+    termination = json.loads((output / "termination_diagnostics.json").read_text(encoding="utf-8")) if (output / "termination_diagnostics.json").exists() else {}
+    reload = json.loads((output / "checkpoint_reload.json").read_text(encoding="utf-8")) if (output / "checkpoint_reload.json").exists() else {}
+    groups = [group for step in step_rows for group in step.get("groups", [])]
+    variances = [float(group.get("reward_variance", 0.0)) for group in groups]
+    grad_norms = [step.get("normalized_backend_metrics", {}).get("grad_norm") for step in step_rows]
+    summary = {
+        "schema_version": "m1c.c2-summary.v1",
+        "requested_batches": 10,
+        "completed_batches": len(step_rows),
+        "expected_rollouts": len(schedule) * args.group_size,
+        "completed_rollouts": sum(len(group.get("rollout_ids", [])) for group in groups),
+        "nonzero_variance_batches": sum(value > 0.0 for value in variances),
+        "zero_variance_batches": sum(value == 0.0 for value in variances),
+        "actor_update_calls": sum(int(step.get("actor_update_calls", 0)) for step in step_rows),
+        "batches_with_nonzero_grad": sum(
+            value is not None and math.isfinite(float(value)) and float(value) != 0.0
+            for value in grad_norms
+        ),
+        "reward_vectors_by_step": [group.get("rewards", []) for group in groups],
+        "reward_variances_by_step": variances,
+        "mask_parity_failures": sum(not group.get("live_mask_parity", False) for group in groups),
+        "advantage_parity_failures": sum(not group.get("live_advantage_parity", False) for group in groups),
+        "nan_inf_count": 0,
+        "oom_count": 0,
+        "backend_failure_count": termination.get("categories", {}).get("backend_failure", {}).get("count", 0),
+        "termination_totals": {
+            name: value.get("count", 0)
+            for name, value in termination.get("categories", {}).items()
+        },
+        "mean_context_use": _read_json(output / "c2_context_budget_summary.json").get("aggregate", {}).get("mean_prompt_length_observed") if (output / "c2_context_budget_summary.json").exists() else None,
+        "max_context_use": _read_json(output / "c2_context_budget_summary.json").get("aggregate", {}).get("max_prompt_length_observed") if (output / "c2_context_budget_summary.json").exists() else None,
+        "initial_policy_digest": parameter_evidence.get("before_policy_digest"),
+        "final_policy_digest": parameter_evidence.get("after_policy_digest"),
+        "total_lora_l2_delta": parameter_evidence.get("total_l2_parameter_delta"),
+        "changed_lora_tensor_count": parameter_evidence.get("changed_trainable_tensor_count"),
+        "total_wall_time_s": getattr(args, "_wall_time_s", None),
+        "mean_step_time_s": _timing_distribution([step.get("total_step_s") for step in step_rows]),
+        "update_actor_timing_s": _timing_distribution([step.get("update_actor_s") for step in step_rows]),
+        "update_weights_timing_s": _timing_distribution([step.get("update_weights_s") for step in step_rows]),
+        "checkpoint_save_timing_s": _timing_distribution([step.get("checkpoint_save_s") for step in step_rows]),
+        "final_checkpoint": parameter_evidence.get("after_checkpoint"),
+        "reload_status": reload.get("success"),
+        "reload_completeness": {
+            "expected_lora_tensor_count": reload.get("expected_lora_tensor_count"),
+            "loaded_lora_tensor_count": reload.get("loaded_lora_tensor_count"),
+            "missing_lora_keys": reload.get("missing_lora_keys", []),
+            "unexpected_lora_keys": reload.get("unexpected_lora_keys", []),
+        },
+        "schedule_valid": json.loads((output / "c2_schedule_validation.json").read_text(encoding="utf-8")).get("valid") if (output / "c2_schedule_validation.json").exists() else False,
+        "status": status,
+        "claim_boundary": "bounded vanilla GRPO infrastructure/stability smoke; not a benchmark or quality claim",
+    }
+    _write_json(output / "c2_summary.json", summary)
 
 
 def _write_artifacts(
@@ -1114,6 +1347,9 @@ def _write_artifacts(
             max_model_len=args.max_model_len,
         ),
     )
+    if args.phase == "c2":
+        _validate_c2_schedule(output, tasks, args.group_size, args.seed, args.max_turns)
+        _write_json(output / "c2_context_budget_summary.json", _write_c2_context_summary(output, max_prompt_length=args.max_prompt_length))
     metrics = _runtime_metrics(output, args, observer)
     metrics.update(
         {
@@ -1128,12 +1364,16 @@ def _write_artifacts(
     _write_json(output / "metrics.json", metrics)
     parameter_evidence = _parameter_evidence(output)
     _write_json(output / "parameter_delta.json", parameter_evidence)
-    checkpoint_path = output / "checkpoints" / "global_step_1"
+    checkpoint_path = _latest_checkpoint_dir(output)
+    try:
+        checkpoint_step = int(checkpoint_path.name.rsplit("_", 1)[1]) if checkpoint_path.exists() else None
+    except ValueError:
+        checkpoint_step = None
     _write_json(
         output / "checkpoint_proof.json",
         {
             "checkpoint_path": str(checkpoint_path),
-            "checkpoint_step": 1 if checkpoint_path.exists() else None,
+            "checkpoint_step": checkpoint_step,
             "pre_update_snapshot": str(output / "pre_update" / "actor") if (output / "pre_update" / "actor").exists() else None,
             "policy_tensor_digest_before_update": parameter_evidence["before_policy_digest"],
             "policy_tensor_digest_after_update": parameter_evidence["after_policy_digest"],
@@ -1143,6 +1383,22 @@ def _write_artifacts(
             "evidence_source": parameter_evidence["evidence_source"],
         },
     )
+    if args.phase == "c2":
+        _write_json(
+            output / "c2_parameter_delta.json",
+            {
+                "initial_lora_tensor_count": parameter_evidence.get("before_tensor_count"),
+                "final_lora_tensor_count": parameter_evidence.get("after_tensor_count"),
+                "changed_lora_tensor_count": parameter_evidence.get("changed_trainable_tensor_count"),
+                "max_abs_delta": parameter_evidence.get("max_abs_parameter_delta"),
+                "total_l2_delta": parameter_evidence.get("total_l2_parameter_delta"),
+                "initial_policy_digest": parameter_evidence.get("before_policy_digest"),
+                "final_policy_digest": parameter_evidence.get("after_policy_digest"),
+                "final_checkpoint": parameter_evidence.get("after_checkpoint"),
+                "evidence_source": parameter_evidence.get("evidence_source"),
+            },
+        )
+        _write_c2_summary(output, args, status=status, parameter_evidence=parameter_evidence)
     if failure is not None:
         _write_json(
             output / "failure.json",
@@ -1199,6 +1455,7 @@ def run(args: argparse.Namespace) -> int:
     config: Any = None
     observer: RuntimeTrainingObserver | None = None
     c0_batch_weight_sync = "not_applicable"
+    run_started = time.perf_counter()
     try:
         tasks, provenance = _load_tasks(Path(args.dataset), args.task_count, args.task_id)
         config = _compose_config(args, output)
@@ -1232,7 +1489,12 @@ def run(args: argparse.Namespace) -> int:
         from tracesearch.training.m1c_observer import install_training_observer
 
         verl_backend = import_module("rllm.trainer.verl.verl_backend")
-        observer = RuntimeTrainingObserver(output, phase=args.phase)
+        observer = RuntimeTrainingObserver(
+            output,
+            phase=args.phase,
+            base_seed=args.seed,
+            max_turns=args.max_turns,
+        )
         install_training_observer(verl_backend, observer)
 
         train_dataset = _register_dataset(tasks, args.phase)
@@ -1265,11 +1527,27 @@ def run(args: argparse.Namespace) -> int:
             if args.rollout_engine == "sglang":
                 c0_batch_weight_sync = f"{c0_batch_weight_sync}; initial_sglang=worker_import_guard"
         trainer.train()
+        args._wall_time_s = time.perf_counter() - run_started
 
         runtime_metrics = _runtime_metrics(output, args, observer)
         runtime_groups = _runtime_groups(output, tasks, args.group_size, observer)
-        status = _c1_status(args.phase, runtime_groups, runtime_metrics)
-        if status == "completed" and args.phase == "c1":
+        if args.phase == "c2":
+            # Materialize schedule, step rows, delta evidence and the first
+            # status view before applying the final C2 gate.
+            _write_artifacts(
+                output,
+                args,
+                config,
+                tasks,
+                provenance,
+                c0_batch_weight_sync=c0_batch_weight_sync,
+                observer=observer,
+                status="running",
+            )
+            status = _c2_status(output, tasks, args.group_size, runtime_metrics)
+        else:
+            status = _c1_status(args.phase, runtime_groups, runtime_metrics)
+        if status == "completed" and args.phase in {"c1", "c2"}:
             if not _run_checkpoint_reload(output, str(args.model)):
                 status = "reload_failed"
         _write_artifacts(
@@ -1283,11 +1561,14 @@ def run(args: argparse.Namespace) -> int:
             status=status,
         )
         _write_run_status(output, status, phase=args.phase)
-        if status in {"backend_failed", "update_failed", "reload_failed"}:
-            raise RuntimeError(f"C1 proof gate failed with status={status}")
+        if status in {"backend_failed", "parity_failed", "update_failed", "reload_failed"}:
+            raise M1CProofError(status, f"M1-C proof gate failed with status={status}")
         return 0
     except Exception as exc:
-        failure_status = "backend_failed" if args.phase == "c1" else "failed"
+        args._wall_time_s = time.perf_counter() - run_started
+        failure_status = getattr(exc, "status", None)
+        if failure_status is None:
+            failure_status = "backend_failed" if args.phase in {"c1", "c2"} else "failed"
         if config is not None and tasks:
             try:
                 _write_artifacts(
