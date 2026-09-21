@@ -12,6 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument("--checkpoint")
     parser.add_argument("--backend", choices=("rllm-verl",), default="rllm-verl")
+    parser.add_argument("--rollout-engine", choices=("vllm", "sglang"), default="vllm")
     parser.add_argument("--phase", choices=("c0", "c1", "c2"), default="c0")
     parser.add_argument("--dataset", default="data/m1/dev.jsonl")
     parser.add_argument("--corpus", default="data/m0/corpus.jsonl")
@@ -22,9 +23,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
-    parser.add_argument("--cpu-offload-gb", type=float, default=4.0)
-    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--cpu-offload-gb", type=float, default=None)
+    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=None)
     return parser
 
 
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint = args.checkpoint or args.model
     backend_args = argparse.Namespace(
         phase=args.phase,
+        config=args.config,
         model=checkpoint,
         dataset=args.dataset,
         corpus=args.corpus,
@@ -55,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         gpu_memory_utilization=args.gpu_memory_utilization,
         cpu_offload_gb=args.cpu_offload_gb,
         enforce_eager=args.enforce_eager,
+        rollout_engine=args.rollout_engine,
     )
     return run(backend_args)
 

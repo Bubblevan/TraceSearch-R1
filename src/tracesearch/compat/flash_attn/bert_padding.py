@@ -1,10 +1,4 @@
-"""Pure-PyTorch fallback for flash-attn's padding helpers.
-
-This module only covers the data-layout helpers imported by veRL.  It is not a
-FlashAttention implementation and must not be used as one.  Keeping these
-helpers local lets veRL's SDPA/FSDP path run in a minimal CUDA environment
-where the optional ``flash-attn`` extension is not installed.
-"""
+"""Pure-PyTorch fallback for the small padding API used by veRL."""
 
 from __future__ import annotations
 
@@ -40,9 +34,7 @@ index_first_axis = _IndexFirstAxis.apply
 
 class _IndexPutFirstAxis(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx, values: torch.Tensor, indices: torch.Tensor, first_axis_dim: int
-    ) -> torch.Tensor:
+    def forward(ctx, values: torch.Tensor, indices: torch.Tensor, first_axis_dim: int) -> torch.Tensor:
         ctx.save_for_backward(indices)
         ctx.first_axis_dim = first_axis_dim
         output = torch.zeros(
@@ -67,37 +59,22 @@ def unpad_input(
     attention_mask: torch.Tensor,
     unused_mask: Optional[torch.Tensor] = None,
 ):
-    """Remove masked positions, matching flash-attn's ``unpad_input`` API."""
-
     all_masks = attention_mask if unused_mask is None else attention_mask + unused_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(all_masks.reshape(-1), as_tuple=False).flatten()
     max_seqlen_in_batch = int(seqlens_in_batch.max().item())
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
-    hidden_states = rearrange(hidden_states, "b s ... -> (b s) ...")
-    return (
-        index_first_axis(hidden_states, indices),
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-        used_seqlens_in_batch,
-    )
+    hidden_states = _einops_rearrange(hidden_states, "b s ... -> (b s) ...")
+    return index_first_axis(hidden_states, indices), indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch
 
 
-def pad_input(
-    hidden_states: torch.Tensor,
-    indices: torch.Tensor,
-    batch: int,
-    seqlen: int,
-) -> torch.Tensor:
-    """Restore a flattened tensor to ``(batch, seqlen, ...)`` layout."""
-
+def pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch: int, seqlen: int) -> torch.Tensor:
     output = index_put_first_axis(hidden_states, indices, batch * seqlen)
-    return rearrange(output, "(b s) ... -> b s ...", b=batch)
+    return _einops_rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
 def rearrange(*args, **kwargs):
-    """Expose the helper expected by veRL's attention utility wrapper."""
+    """Expose the layout helper expected by older veRL adapters."""
 
     return _einops_rearrange(*args, **kwargs)

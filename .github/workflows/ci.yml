@@ -12,8 +12,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - run: uv venv --python 3.11
-      - run: uv pip install --python .venv/bin/python -e ".[dev]"
-      - run: uv run --python .venv/bin/python pytest
-      - run: uv run --python .venv/bin/python -m tracesearch.cli.run_m0 --output runs/ci-smoke
-      - run: uv run --python .venv/bin/python -m tracesearch.cli.run_m1_train --help
+          activate-environment: true
+      # setup-uv owns the single project .venv; do not create it a second time.
+      - run: uv pip install -e ".[dev]"
+      - run: uv run pytest
+      - run: uv run python -m tracesearch.cli.run_m0 --output runs/ci-smoke
+      - run: uv run python -m tracesearch.cli.run_m1_train --help

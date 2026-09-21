@@ -2,10 +2,15 @@
   "schema_version": "tracesearch.m1c.backend-lock.v1",
   "environment": {
     "platform": "WSL2 Ubuntu-24.04",
-    "python": "3.12.3",
+    "python": "3.12.8",
     "manager": "uv",
     "environment_path": ".venvs/tracesearch-m1c",
-    "native_windows_venv": "not used"
+    "native_windows_venv": "not used",
+    "wsl_kernel": "5.15.133.1-microsoft-standard-WSL2",
+    "gpu": "NVIDIA GeForce RTX 4090 Laptop GPU, 16376 MiB",
+    "nvidia_driver": "616.92",
+    "cuda_runtime": "13.0",
+    "ubuntu": "24.04.1 LTS"
   },
   "source_commits": {
     "rllm": "3b40c37cf6a262cf4d28cc987ebe4f4cf797956c",
@@ -21,7 +26,19 @@
     "ray": "2.58.0",
     "numpy": "2.3.5",
     "flashinfer-python": "0.6.11.post2",
-    "flashinfer-cubin": "0.6.11.post2"
+    "flashinfer-cubin": "0.6.11.post2",
+    "flash-attn": "2.8.3"
+  },
+  "flash_attention_wheel": {
+    "filename": "flash_attn-2.8.3+cu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
+    "source_url": "https://huggingface.co/spaces/prithivMLmods/Image-to-3D-Video-Asset-Generator/resolve/main/flash_attention_2/flash_attn-2.8.3%2Bcu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
+    "source_repository": "prithivMLmods/Image-to-3D-Video-Asset-Generator",
+    "sha256": "eea423825f3e12818b98b2078e2cb5ce6fe6b73d22612316d2a55fad4701938f",
+    "python_abi": "cp312-cp312",
+    "platform": "linux_x86_64",
+    "cuda": "13",
+    "torch": "2.11",
+    "cxx11_abi": true
   },
   "optional_rollout_engines": {
     "sglang": {
@@ -38,7 +55,9 @@
     "verl_async_server_distributed_executor_backend": "mp (hard-coded by veRL 0.8 async server)",
     "tensor_model_parallel_size": 1,
     "max_model_len": 1024,
-    "cpu_offload_gb": 4.0,
+    "gpu_memory_utilization": 0.9,
+    "cpu_offload_gb": 0.0,
+    "enforce_eager": false,
     "attention": "sdpa",
     "lora_sync": "merged_base_weights",
     "lora_target_modules": [
@@ -55,7 +74,8 @@
     "The backend is run only from WSL2/Linux; the native Windows .venv is not modified.",
     "vLLM 0.22.1 resolves transformers 4.57.6; the earlier inspected transformers 5.5.3 source snapshot is not the runtime package.",
     "numpy is explicitly resolved at 2.3.5 because the current rLLM/veRL/vLLM metadata has incompatible numpy constraints.",
-    "flash-attn kernels are optional and remain disabled; the project provides only the layout-only bert_padding compatibility surface needed by veRL's SDPA path.",
+    "The external flash-attn 2.8.3 wheel is imported from its recorded site-packages path; src/flash_attn is intentionally absent so TraceSearch cannot shadow the third-party package.",
+    "vLLM uses its own attention backend in this experiment; the FlashAttention installation primarily resolves the compatible CUDA-extension surface needed by the pinned stack. No rollout speedup is attributed to FlashAttention without profiling evidence.",
     "The first real C0 reached vLLM model load but failed during veRL-to-vLLM dynamic TensorLoRA sync with StopIteration; the merged-LoRA weight-sync mode then reached two real rollout generations. A subsequent veRL batch-postprocessing step exposed the missing optional flash-attn padding helper, now covered by the project compatibility module; no completed C0 training result is claimed until a post-hotfix rerun finishes.",
     "The WSL runner logs the actual EngineCore topology because veRL 0.8 hard-codes the async vLLM server executor backend to mp."
   ]

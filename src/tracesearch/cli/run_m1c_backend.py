@@ -16,11 +16,15 @@ import platform
 import statistics
 import subprocess
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 from tracesearch.data.adapters import NQTaskAdapter
 from tracesearch.training.grpo import compute_group_advantages
+from tracesearch.training.m1c_observer import RuntimeTrainingObserver
+from tracesearch.experiment.provenance import flash_attn_provenance
 from tracesearch.training.trace import GenerationRecord, TrainingTrace
 
 
@@ -32,6 +36,11 @@ VLLM_COMMIT = "0decac0d96c42b49572498019f0a0e3600f50398"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("c0", "c1", "c2"), required=True)
+    parser.add_argument(
+        "--config",
+        default="configs/m1/runtime/4090-16g-wsl.yaml",
+        help="TraceSearch-owned runtime profile; explicit CLI values override it.",
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--dataset", default="data/m1/dev.jsonl")
     parser.add_argument("--corpus", default="data/m0/corpus.jsonl")
@@ -42,12 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.35)
-    parser.add_argument("--cpu-offload-gb", type=float, default=4.0)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--cpu-offload-gb", type=float, default=None)
+    parser.add_argument(
+        "--rollout-engine",
+        choices=("vllm", "sglang"),
+        default="vllm",
+        help="Select the veRL rollout engine; SGLang requires the separate WSL uv environment.",
+    )
     parser.add_argument(
         "--enforce-eager",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Use eager execution in vLLM (use --no-enforce-eager to benchmark CUDA graphs).",
     )
     return parser
@@ -56,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_run_status(output: Path, status: str, **extra: Any) -> None:
+    _write_json(output / "run_status.json", {"status": status, "updated_at": time.time(), **extra})
 
 
 def _git(repo: Path, *args: str) -> str | None:
@@ -103,6 +122,7 @@ def _backend_versions() -> dict[str, Any]:
         result["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     except Exception as exc:  # pragma: no cover - backend environment dependent.
         result["torch_runtime_error"] = f"{type(exc).__name__}: {exc}"
+    result["flash_attn_provenance"] = flash_attn_provenance()
     return result
 
 
@@ -120,10 +140,68 @@ def _load_tasks(path: Path, task_count: int) -> tuple[list[Any], dict[str, Any]]
     return tasks, dataset.manifest_fields()
 
 
+def _apply_runtime_profile(args: argparse.Namespace) -> dict[str, Any]:
+    """Load the owned profile and let explicit CLI values take precedence."""
+
+    config_path = Path(getattr(args, "config", "configs/m1/runtime/4090-16g-wsl.yaml"))
+    if not config_path.is_absolute():
+        config_path = Path.cwd() / config_path
+    profile: dict[str, Any] = {}
+    if config_path.is_file():
+        try:
+            from omegaconf import OmegaConf
+
+            profile = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)  # type: ignore[assignment]
+        except ModuleNotFoundError:
+            # The CPU/dev installation intentionally does not pull the Linux
+            # Hydra stack.  Keep profile loading testable without making the
+            # backend dependency mandatory for ordinary project commands.
+            current: list[tuple[int, dict[str, Any]]] = [(-1, profile)]
+            for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip() or raw_line.lstrip().startswith("#") or ":" not in raw_line:
+                    continue
+                indent = len(raw_line) - len(raw_line.lstrip())
+                key, raw_value = raw_line.strip().split(":", 1)
+                while current[-1][0] >= indent:
+                    current.pop()
+                parent = current[-1][1]
+                value = raw_value.strip()
+                if not value:
+                    parent[key] = {}
+                    current.append((indent, parent[key]))
+                elif value.lower() in {"true", "false"}:
+                    parent[key] = value.lower() == "true"
+                else:
+                    try:
+                        parent[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        try:
+                            parent[key] = float(value) if "." in value or "e" in value.lower() else int(value)
+                        except ValueError:
+                            parent[key] = value.strip('"\'')
+    runtime = profile.get("runtime", {})
+
+    def resolve(name: str, profile_name: str, default: Any) -> Any:
+        value = getattr(args, name, None)
+        if value is not None:
+            return value
+        return runtime.get(profile_name, default)
+
+    args.gpu_memory_utilization = float(resolve("gpu_memory_utilization", "gpu_memory_utilization", 0.35))
+    args.cpu_offload_gb = float(resolve("cpu_offload_gb", "cpu_offload_gb", 4.0))
+    args.enforce_eager = bool(resolve("enforce_eager", "enforce_eager", True))
+    args.tensor_model_parallel_size = int(resolve("tensor_model_parallel_size", "tensor_model_parallel_size", 1))
+    args.max_model_len = int(resolve("max_model_len", "max_model_len", 1024))
+    args.max_num_batched_tokens = int(resolve("max_num_batched_tokens", "max_num_batched_tokens", 4096))
+    args._runtime_profile_path = str(config_path)
+    return profile
+
+
 def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     from hydra import compose, initialize_config_module
     from omegaconf import OmegaConf
 
+    profile = _apply_runtime_profile(args)
     with initialize_config_module(version_base=None, config_module="rllm.trainer.config"):
         config = compose(config_name="unified")
 
@@ -196,7 +274,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("data.max_prompt_length", 512)
     set_value("data.max_response_length", max_response_length)
     set_value("data.trust_remote_code", False)
-    set_value("actor_rollout_ref.rollout.name", "vllm")
+    set_value("actor_rollout_ref.rollout.name", args.rollout_engine)
     set_value("actor_rollout_ref.rollout.mode", "async")
     set_value("actor_rollout_ref.rollout.n", args.group_size)
     set_value("actor_rollout_ref.rollout.temperature", 1.0)
@@ -209,20 +287,23 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.rollout.n_gpus_per_node", 1)
     set_value("actor_rollout_ref.rollout.nnodes", 1)
     set_value("actor_rollout_ref.rollout.gpu_memory_utilization", args.gpu_memory_utilization)
-    set_value("actor_rollout_ref.rollout.max_num_batched_tokens", 4096)
+    set_value("actor_rollout_ref.rollout.max_num_batched_tokens", args.max_num_batched_tokens)
     set_value("actor_rollout_ref.rollout.max_num_seqs", args.group_size)
     # The pinned veRL config defaults this legacy rollout field to two-way
     # tensor parallelism.  M1-C's WSL smoke/training contract is one GPU, so
     # make the native rollout setting explicit as well as the rLLM setting.
-    set_value("actor_rollout_ref.rollout.tensor_model_parallel_size", 1)
+    set_value("actor_rollout_ref.rollout.tensor_model_parallel_size", args.tensor_model_parallel_size)
     # The single-GPU WSL colocated run keeps the FSDP actor resident while
     # vLLM reserves KV-cache blocks.  1024 covers the M1-C prompt/response
     # contract and leaves room for those blocks on a 16 GiB card.
-    set_value("actor_rollout_ref.rollout.max_model_len", 1024)
+    set_value("actor_rollout_ref.rollout.max_model_len", args.max_model_len)
     set_value("actor_rollout_ref.rollout.enable_prefix_caching", False)
     set_value("actor_rollout_ref.rollout.enforce_eager", args.enforce_eager)
     set_value("actor_rollout_ref.rollout.load_format", "auto")
-    set_value("actor_rollout_ref.rollout.free_cache_engine", True)
+    # SGLang's veRL HYBRID adapter does not implement the generic wake_up()
+    # path.  C0 skips the initial weight transfer, so keep its KV cache
+    # resident instead of leaving the request pool CPU-backed.
+    set_value("actor_rollout_ref.rollout.free_cache_engine", args.rollout_engine != "sglang")
     # veRL's colocated actor keeps FSDP resident while vLLM starts.  On the
     # 16 GiB WSL GPU, CPU offload is the supported vLLM escape hatch that
     # leaves enough device memory for at least one KV-cache block.
@@ -250,11 +331,11 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.ref.use_torch_compile", False)
     set_value("actor_rollout_ref.ref.fsdp_config.use_torch_compile", False)
     set_value("actor_rollout_ref.model.use_shm", False)
-    # The isolated WSL env intentionally does not require the optional
-    # flash-attn extension.  veRL still routes its batch adapter through
-    # ``flash_attn.bert_padding``; the project ships a small layout-only
-    # compatibility module for that import.  Keep the actual FSDP model on
-    # the padded SDPA path so sequences cannot attend across sample boundaries.
+    # The isolated WSL env records and imports the external flash-attn wheel;
+    # the actual FSDP model still uses padded SDPA so sequences cannot attend
+    # across sample boundaries.  Any pure-PyTorch fallback lives under the
+    # explicit ``tracesearch.compat.flash_attn`` namespace and is never a
+    # package-name shadow.
     set_value("actor_rollout_ref.model.override_config.attn_implementation", "sdpa", force_add=True)
     set_value("actor_rollout_ref.model.enable_gradient_checkpointing", True)
     set_value("actor_rollout_ref.model.use_remove_padding", False)
@@ -271,6 +352,13 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
         ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
     set_value("actor_rollout_ref.model.lora.merge", True)
+    if args.rollout_engine == "sglang":
+        # SGLang 0.5.11 cannot build its Qwen2/Qwen2.5 LoRA memory pool on
+        # this stack (get_hidden_dim is not implemented for the model type).
+        # C0 has a zero-initialized adapter and no optimizer update, so using
+        # the base model is behaviorally equivalent for this serving comparison.
+        set_value("actor_rollout_ref.model.lora_rank", 0)
+        set_value("actor_rollout_ref.model.lora.rank", 0)
 
     set_value("actor_rollout_ref.actor.ppo_mini_batch_size", 1)
     set_value("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", 1)
@@ -291,6 +379,11 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.actor.use_rollout_log_probs", True)
     set_value("actor_rollout_ref.actor.optim.lr", 1e-6)
     set_value("actor_rollout_ref.actor.optim.weight_decay", 0.0)
+
+    # Preserve the owned (fully resolved) profile in the backend config.  This
+    # is part of the artifact contract, not a second source of runtime values.
+    set_value("tracesearch.runtime_profile_path", getattr(args, "_runtime_profile_path", None), force_add=True)
+    set_value("tracesearch.runtime_profile", profile, force_add=True)
 
     return config
 
@@ -464,6 +557,104 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _parameter_evidence(output: Path) -> dict[str, Any]:
+    probes = []
+    for path in sorted((output / "parameter_probe").glob("actor_update_*.json")):
+        try:
+            probes.append(json.loads(path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+    successful = [item for item in probes if item.get("update_succeeded")]
+    changed = sum(int(item.get("changed_trainable_tensor_count", 0)) for item in successful)
+    max_abs = max((float(item.get("max_abs_parameter_delta", 0.0)) for item in successful), default=0.0)
+    l2 = sum(float(item.get("total_l2_parameter_delta", 0.0)) ** 2 for item in successful) ** 0.5
+    before = successful[0].get("before") if successful else None
+    after = successful[-1].get("after") if successful else None
+    before_digest = before.get("trainable_parameter_digest") if before else None
+    after_digest = after.get("trainable_parameter_digest") if after else None
+    return {
+        "probe_count": len(probes),
+        "successful_probe_count": len(successful),
+        "trainable_tensor_count": len((before or {}).get("trainable_tensors", {})) if before else None,
+        "total_trainable_parameters": (before or {}).get("total_trainable_parameters") if before else None,
+        "total_model_parameters": (before or {}).get("total_model_parameters") if before else None,
+        "trainable_parameter_percentage": (
+            100.0 * float((before or {}).get("total_trainable_parameters", 0)) / float((before or {}).get("total_model_parameters", 1))
+            if before and (before or {}).get("total_model_parameters")
+            else None
+        ),
+        "changed_trainable_tensor_count": changed,
+        "max_abs_parameter_delta": max_abs if successful else None,
+        "total_l2_parameter_delta": l2 if successful else None,
+        "before_policy_digest": before_digest,
+        "after_policy_digest": after_digest,
+        "nonzero_parameter_updates": changed,
+        "probes": probes,
+    }
+
+
+def _runtime_metrics(output: Path, args: argparse.Namespace, observer: RuntimeTrainingObserver | None) -> dict[str, Any]:
+    batches = observer.records if observer is not None else []
+    parameter_evidence = _parameter_evidence(output)
+    observed_actor_update_calls = sum(int(row.get("observed_actor_update_calls", 0)) for row in batches)
+    probe_count = int(parameter_evidence["probe_count"])
+    return {
+        "phase": args.phase,
+        "requested_optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
+        "observed_actor_update_calls": observed_actor_update_calls if batches else None,
+        "observed_optimizer_steps": probe_count if batches else None,
+        "nonzero_parameter_updates": parameter_evidence["nonzero_parameter_updates"],
+        "optimizer_steps_source": "runtime observer and actor parameter probes; never inferred from phase",
+        "batches": batches,
+        "parameter_evidence": {key: value for key, value in parameter_evidence.items() if key != "probes"},
+    }
+
+
+def _c1_status(phase: str, groups: list[dict[str, Any]], metrics: dict[str, Any]) -> str:
+    """Apply the TRD's C1 proof gate without changing reward semantics."""
+
+    if phase != "c1":
+        return "completed"
+    if not any(float(group.get("group_exact_match_variance", 0.0)) > 0.0 for group in groups):
+        return "no_learning_signal"
+    if int(metrics.get("observed_actor_update_calls") or 0) <= 0:
+        return "failed"
+    if int(metrics.get("nonzero_parameter_updates") or 0) <= 0:
+        return "failed"
+    return "completed"
+
+
+def _run_checkpoint_reload(output: Path, model: str) -> bool:
+    checkpoint = output / "checkpoints" / "global_step_1"
+    result_path = output / "checkpoint_reload.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tracesearch.cli.reload_m1c_checkpoint",
+            "--base-model",
+            model,
+            "--checkpoint",
+            str(checkpoint),
+            "--output",
+            str(result_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    (output / "checkpoint_reload_process.log").write_text(
+        completed.stdout + ("\n" + completed.stderr if completed.stderr else ""),
+        encoding="utf-8",
+    )
+    if not result_path.exists():
+        return False
+    try:
+        return bool(json.loads(result_path.read_text(encoding="utf-8")).get("success")) and completed.returncode == 0
+    except json.JSONDecodeError:
+        return False
+
+
 def _write_artifacts(
     output: Path,
     args: argparse.Namespace,
@@ -472,6 +663,9 @@ def _write_artifacts(
     provenance: dict[str, Any],
     *,
     c0_batch_weight_sync: str,
+    observer: RuntimeTrainingObserver | None = None,
+    status: str = "completed",
+    failure: BaseException | None = None,
 ) -> None:
     from omegaconf import OmegaConf
 
@@ -524,27 +718,49 @@ def _write_artifacts(
             "c0_batch_end_weight_sync": c0_batch_weight_sync,
             "cpu_offload_gb": args.cpu_offload_gb,
             "enforce_eager": args.enforce_eager,
+            "rollout_engine": args.rollout_engine,
+            "sglang_lora_disabled": args.rollout_engine == "sglang",
         },
+        "runtime_profile": getattr(args, "_runtime_profile_path", None),
         "dependency_resolution_note": "rLLM current metadata conflicts with veRL/vLLM numpy constraints; this isolated env uses the explicitly recorded numpy override.",
     }
     _write_json(output / "backend_manifest.json", manifest)
     _write_json(output / "resolved_config.json", OmegaConf.to_container(config, resolve=False))
+    _write_json(output / "flash_attn_provenance.json", versions.get("flash_attn_provenance", {}))
     _write_json(output / "mask_parity.json", _mask_parity())
     _write_json(output / "advantage_parity.json", _advantage_parity())
     summary = _summarize_rollouts(output, tasks, args.group_size, args.phase)
-    metrics = {
-        "phase": args.phase,
-        "requested_optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
-        "optimizer_steps": {"c0": 0, "c1": 1, "c2": 10}[args.phase],
-        "optimizer_steps_source": "configured trainer.total_batches; c0 critic_warmup suppresses actor update",
-        "c0_batch_end_weight_sync": c0_batch_weight_sync,
-        "mean_exact_match": summary["mean_exact_match"],
-        "group_exact_match_variance": summary["group_exact_match_variance"],
-        "zero_variance_groups": summary["group_exact_match_variance"] == 0.0,
-        "loss_agg_mode": "seq-mean-token-mean",
-        "status": "completed",
-    }
+    metrics = _runtime_metrics(output, args, observer)
+    metrics.update(
+        {
+            "c0_batch_end_weight_sync": c0_batch_weight_sync,
+            "mean_exact_match": summary["mean_exact_match"],
+            "group_exact_match_variance": summary["group_exact_match_variance"],
+            "zero_variance_groups": summary["group_exact_match_variance"] == 0.0,
+            "loss_agg_mode": "seq-mean-token-mean",
+            "status": status,
+        }
+    )
     _write_json(output / "metrics.json", metrics)
+    parameter_evidence = _parameter_evidence(output)
+    _write_json(output / "parameter_delta.json", parameter_evidence)
+    checkpoint_path = output / "checkpoints" / "global_step_1"
+    _write_json(
+        output / "checkpoint_proof.json",
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_step": 1 if checkpoint_path.exists() else None,
+            "policy_tensor_digest_before_update": parameter_evidence["before_policy_digest"],
+            "policy_tensor_digest_after_update": parameter_evidence["after_policy_digest"],
+            "observed_actor_update_count": metrics["observed_actor_update_calls"],
+            "observed_nonzero_policy_update_count": parameter_evidence["nonzero_parameter_updates"],
+        },
+    )
+    if failure is not None:
+        _write_json(
+            output / "failure.json",
+            {"exception": type(failure).__name__, "message": str(failure), "traceback": traceback.format_exc()},
+        )
     (output / "summary.md").write_text(
         "\n".join(
             [
@@ -553,13 +769,16 @@ def _write_artifacts(
                 f"- Backend commit: `{RLLM_COMMIT}` / veRL `{VERL_COMMIT}` / vLLM `{VLLM_COMMIT}`",
                 f"- Project commit: `{manifest['git_commit']}`",
                 f"- Git dirty: `{manifest['git_dirty']}`",
-                f"- Optimizer steps: `{metrics['optimizer_steps']}`",
+                f"- Requested optimizer steps: `{metrics['requested_optimizer_steps']}`",
+                f"- Observed actor update calls: `{metrics['observed_actor_update_calls']}`",
+                f"- Observed optimizer steps: `{metrics['observed_optimizer_steps']}`",
                 f"- C0 batch-end weight sync: `{c0_batch_weight_sync}`",
                 f"- Rollout slots: `{summary['completed_rollout_slots']}/{summary['denominator']}`",
                 f"- Mean exact match: `{summary['mean_exact_match']}`",
                 f"- Group exact-match variance: `{summary['group_exact_match_variance']}`",
                 "- Reward: normalized exact match only; no process reward, KL, rejection sampling, or fatal-aware shaping.",
                 "- `group_reward_variance` is intentionally not used: evaluator variance is named `group_exact_match_variance`.",
+                f"- Run status: `{status}`",
             ]
         )
         + "\n",
@@ -573,53 +792,115 @@ def run(args: argparse.Namespace) -> int:
     # does not guarantee an in-process EngineCore; the resolved config and
     # console log remain the source of truth for the actual runtime topology.
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    os.environ["TRACESEARCH_M1C_PHASE"] = args.phase
+    if args.phase == "c0":
+        # AgentTrainer constructs the real VerlBackend inside its Ray worker;
+        # install the post-batch C0 guard from the workflow module there too.
+        os.environ["TRACESEARCH_C0_SKIP_BATCH_END_SYNC"] = "1"
+    if args.phase == "c0" and args.rollout_engine == "sglang":
+        # The actual veRL backend is instantiated in the Ray worker; the
+        # workflow module applies the C0 initial-sync guard there on import.
+        os.environ["TRACESEARCH_C0_SGLANG_SKIP_INITIAL_SYNC"] = "1"
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    tasks, provenance = _load_tasks(Path(args.dataset), args.task_count)
-    config = _compose_config(args, output)
-
-    from rllm.trainer import AgentTrainer
-    from tracesearch.training.rllm_workflow import TraceSearchWorkflow
-
-    train_dataset = _register_dataset(tasks, args.phase)
-    trainer = AgentTrainer(
-        config=config,
-        workflow_class=TraceSearchWorkflow,
-        train_dataset=train_dataset,
-        val_dataset=None,
-        backend="verl",
-        workflow_args={
-            "corpus_path": str(Path(args.corpus).resolve()),
-            "checkpoint": str(Path(args.model).resolve()),
-            "top_k": args.top_k,
-            "max_turns": args.max_turns,
-            "max_tokens": args.max_tokens,
-            "seed": args.seed,
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "top_k_sampling": None,
-            "artifact_dir": str(output),
-            "disable_thinking": True,
-        },
-    )
+    _write_run_status(output, "initializing", phase=args.phase)
+    os.environ["TRACESEARCH_M1C_OBSERVER_DIR"] = str(output)
+    tasks: list[Any] = []
+    provenance: dict[str, Any] = {}
+    config: Any = None
+    observer: RuntimeTrainingObserver | None = None
     c0_batch_weight_sync = "not_applicable"
-    if args.phase == "c0":
+    try:
+        tasks, provenance = _load_tasks(Path(args.dataset), args.task_count)
+        config = _compose_config(args, output)
+        _write_json(output / "resolved_config.json", __import__("omegaconf").OmegaConf.to_container(config, resolve=False))
+        _write_run_status(output, "running", phase=args.phase, task_count=len(tasks), group_size=args.group_size)
+
         from importlib import import_module
+        from rllm.trainer import AgentTrainer
+        from tracesearch.training.rllm_workflow import TraceSearchWorkflow
+        from tracesearch.training.m1c_observer import install_training_observer
 
         verl_backend = import_module("rllm.trainer.verl.verl_backend")
-        from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
+        observer = RuntimeTrainingObserver(output, phase=args.phase)
+        install_training_observer(verl_backend, observer)
 
-        c0_batch_weight_sync = install_c0_post_batch_weight_sync_skip(verl_backend)
-    trainer.train()
-    _write_artifacts(
-        output,
-        args,
-        config,
-        tasks,
-        provenance,
-        c0_batch_weight_sync=c0_batch_weight_sync,
-    )
-    return 0
+        train_dataset = _register_dataset(tasks, args.phase)
+        trainer = AgentTrainer(
+            config=config,
+            workflow_class=TraceSearchWorkflow,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            backend="verl",
+            workflow_args={
+                "corpus_path": str(Path(args.corpus).resolve()),
+                "checkpoint": str(Path(args.model).resolve()),
+                "top_k": args.top_k,
+                "max_turns": args.max_turns,
+                "max_tokens": args.max_tokens,
+                "seed": args.seed,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k_sampling": None,
+                "artifact_dir": str(output),
+                "disable_thinking": True,
+            },
+        )
+        if args.phase == "c0":
+            from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
+
+            c0_batch_weight_sync = install_c0_post_batch_weight_sync_skip(verl_backend, phase="c0")
+            if args.rollout_engine == "sglang":
+                c0_batch_weight_sync = f"{c0_batch_weight_sync}; initial_sglang=worker_import_guard"
+        trainer.train()
+
+        summary_rows = []
+        groups_path = output / "rollout_groups.jsonl"
+        if groups_path.exists():
+            summary_rows = [json.loads(line) for line in groups_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        status = _c1_status(args.phase, summary_rows, _runtime_metrics(output, args, observer))
+        if status == "completed" and args.phase == "c1":
+            if not _run_checkpoint_reload(output, str(args.model)):
+                status = "failed"
+        _write_artifacts(
+            output,
+            args,
+            config,
+            tasks,
+            provenance,
+            c0_batch_weight_sync=c0_batch_weight_sync,
+            observer=observer,
+            status=status,
+        )
+        _write_run_status(output, status, phase=args.phase)
+        if status == "failed":
+            raise RuntimeError("C1 proof gate failed: non-zero group signal had no observed actor/parameter update")
+        return 0
+    except Exception as exc:
+        if config is not None and tasks:
+            try:
+                _write_artifacts(
+                    output,
+                    args,
+                    config,
+                    tasks,
+                    provenance,
+                    c0_batch_weight_sync=c0_batch_weight_sync,
+                    observer=observer,
+                    status="failed",
+                    failure=exc,
+                )
+            except Exception as artifact_exc:
+                _write_json(output / "failure.json", {"exception": type(exc).__name__, "message": str(exc), "artifact_error": f"{type(artifact_exc).__name__}: {artifact_exc}"})
+        else:
+            _write_json(output / "backend_manifest.json", {"schema_version": "m1c.backend.v1", "phase": args.phase, "git_dirty": True})
+            _write_json(output / "resolved_config.json", {})
+            _write_json(output / "failure.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        _write_run_status(output, "failed", phase=args.phase, exception=type(exc).__name__)
+        raise
+    finally:
+        os.environ.pop("TRACESEARCH_M1C_OBSERVER_DIR", None)
+        os.environ.pop("TRACESEARCH_M1C_PHASE", None)
 
 
 def main(argv: list[str] | None = None) -> int:

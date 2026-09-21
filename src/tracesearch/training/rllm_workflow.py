@@ -8,6 +8,7 @@ environment with the optional backend can instantiate ``TraceSearchWorkflow``.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,42 @@ except ImportError:  # pragma: no cover - exercised only when the optional backe
             del args, kwargs
 
 
+_m1c_phase = os.environ.get("TRACESEARCH_M1C_PHASE")
+if (
+    os.environ.get("TRACESEARCH_C0_SGLANG_SKIP_INITIAL_SYNC") == "1"
+    or os.environ.get("TRACESEARCH_C0_SKIP_BATCH_END_SYNC") == "1"
+):
+    if _m1c_phase != "c0":
+        raise RuntimeError(f"C0 sync guards cannot be activated for phase={_m1c_phase!r}")
+    # AgentTrainer creates the real VerlBackend inside its Ray worker.  Apply
+    # this narrowly scoped C0 optimization when this workflow module is
+    # imported in that worker, rather than in the driver process.
+    from importlib import import_module as _import_module
+
+    _verl_backend_module = _import_module("rllm.trainer.verl.verl_backend")
+    if os.environ.get("TRACESEARCH_C0_SGLANG_SKIP_INITIAL_SYNC") == "1":
+        from tracesearch.training.rllm_optimizations import (
+            install_c0_initial_weight_sync_skip as _install_c0_initial_weight_sync_skip,
+        )
+
+        _install_c0_initial_weight_sync_skip(_verl_backend_module, phase="c0")
+    if os.environ.get("TRACESEARCH_C0_SKIP_BATCH_END_SYNC") == "1":
+        from tracesearch.training.rllm_optimizations import (
+            install_c0_post_batch_weight_sync_skip as _install_c0_post_batch_weight_sync_skip,
+        )
+
+        _install_c0_post_batch_weight_sync_skip(_verl_backend_module, phase="c0")
+
+if os.environ.get("TRACESEARCH_M1C_OBSERVER_DIR"):
+    # The actor worker runs in a Ray child process.  The probe is installed
+    # there, where the real FSDP/LoRA tensors live, and writes only runtime
+    # evidence back to the run directory.
+    from importlib import import_module as _import_module
+    from tracesearch.training.m1c_observer import install_actor_update_probe as _install_actor_update_probe
+
+    _install_actor_update_probe(_import_module("verl.workers.engine_workers"))
+
+
 _LOG_LOCK = threading.Lock()
 
 
@@ -58,6 +95,9 @@ class RLLMModelClient:
         model: str,
         config: LLMGenerationConfig,
     ) -> ModelGeneration:
+        rollout_ref = getattr(getattr(self.rollout_engine, "config", None), "actor_rollout_ref", None)
+        rollout_config = getattr(rollout_ref, "rollout", None)
+        rollout_name = getattr(rollout_config, "name", "unknown")
         # rLLM/veRL receives these as sampling_params.  ``None`` is converted
         # to vLLM's explicit disabled top-k value, preserving the M1-C contract.
         params: dict[str, Any] = {
@@ -69,7 +109,10 @@ class RLLMModelClient:
             "repetition_penalty": config.repetition_penalty,
         }
         if config.sampling_seed is not None:
-            params["seed"] = config.sampling_seed
+            # SGLang 0.5.x names the vLLM-compatible sampling field
+            # ``sampling_seed``. Passing ``seed`` reaches its SamplingParams
+            # constructor unchanged and raises a TypeError.
+            params["sampling_seed" if rollout_name == "sglang" else "seed"] = config.sampling_seed
         if config.stop_sequences:
             params["stop"] = list(config.stop_sequences)
         output = await self.rollout_engine.get_model_response(
@@ -90,7 +133,7 @@ class RLLMModelClient:
             metadata={
                 "checkpoint": self.checkpoint,
                 "model_path": self.checkpoint,
-                "backend": "rllm-verl-vllm",
+                "backend": f"rllm-verl-{rollout_name}",
                 "backend_weight_version": output.weight_version,
                 "sampling_config": {
                     "temperature": config.temperature,
