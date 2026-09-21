@@ -275,17 +275,26 @@ def install_training_observer(backend_module: Any, observer: RuntimeTrainingObse
 
 
 def install_actor_update_probe(worker_module: Any) -> str:
-    """Patch the installed worker class only in the spawned runtime process."""
+    """Probe the engine's unregistered train call inside the worker process.
 
-    worker_type = getattr(worker_module, "ActorRolloutRefWorker", None)
-    if worker_type is None:
+    Patching ``ActorRolloutRefWorker.update_actor`` would remove veRL's
+    dispatch registration in this pinned release.  The actor method delegates
+    to ``BaseEngine.train_batch``; that method is not a Ray-registered surface,
+    so it is safe to wrap for tensor evidence.
+    """
+
+    del worker_module
+    from importlib import import_module
+
+    engine_module = import_module("verl.workers.engine.base")
+    engine_type = getattr(engine_module, "BaseEngine", None)
+    if engine_type is None:
         return "unavailable"
-    original = getattr(worker_type, "update_actor", None)
+    original = getattr(engine_type, "train_batch", None)
     if original is None or getattr(original, "_tracesearch_parameter_probe", False):
         return "already_installed"
 
-    def snapshot(worker: Any, *, keep_values: bool = False) -> dict[str, Any]:
-        engine = getattr(getattr(worker, "actor", None), "engine", None)
+    def snapshot(engine: Any, *, keep_values: bool = False) -> dict[str, Any]:
         module = getattr(engine, "module", None)
         result: dict[str, Any] = {"trainable_tensors": {}, "total_model_parameters": None}
         if keep_values:
@@ -363,5 +372,5 @@ def install_actor_update_probe(worker_module: Any) -> str:
         return result
 
     wrapped._tracesearch_parameter_probe = True  # type: ignore[attr-defined]
-    worker_type.update_actor = wrapped
+    engine_type.train_batch = wrapped
     return "installed"
