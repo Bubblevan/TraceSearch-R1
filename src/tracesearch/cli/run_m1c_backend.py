@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from tracesearch.data.adapters import NQTaskAdapter
+from tracesearch.agent.llm import SAMPLING_SEED_SCHEME, sampling_seed_table
 from tracesearch.training.grpo import compute_group_advantages
 from tracesearch.training.m1c_observer import RuntimeTrainingObserver
 from tracesearch.experiment.provenance import flash_attn_provenance
@@ -50,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=96)
+    parser.add_argument(
+        "--max-prompt-length",
+        type=int,
+        default=None,
+        help="TraceSearch-owned prompt budget; profile default is used when omitted.",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--task-id", default=None, help="Select exactly one declared task by task_id without reordering the dataset.")
@@ -90,6 +97,9 @@ _KNOWN_RUN_ARTIFACTS = (
     "run_status.json",
     "failure.json",
     "tracesearch_rollouts.jsonl",
+    "sampling_seeds.jsonl",
+    "sampling_seed_table.json",
+    "context_budget.jsonl",
     "rollout_groups.jsonl",
     "backend_batch_summary.json",
     "metrics.json",
@@ -100,6 +110,9 @@ _KNOWN_RUN_ARTIFACTS = (
     "advantage_parity.json",
     "flash_attn_provenance.json",
     "rollout_logprob_diagnostics.json",
+    "termination_diagnostics.json",
+    "context_budget_summary.json",
+    "tokenizer_prompt_parity.json",
     "parameter_delta.json",
     "checkpoint_proof.json",
     "checkpoint_reload.json",
@@ -250,6 +263,15 @@ def _apply_runtime_profile(args: argparse.Namespace) -> dict[str, Any]:
     args.tensor_model_parallel_size = int(resolve("tensor_model_parallel_size", "tensor_model_parallel_size", 1))
     args.max_model_len = int(resolve("max_model_len", "max_model_len", 1024))
     args.max_num_batched_tokens = int(resolve("max_num_batched_tokens", "max_num_batched_tokens", 4096))
+    args.max_prompt_length = int(resolve("max_prompt_length", "max_prompt_length", 896))
+    if args.max_prompt_length < 1:
+        raise ValueError("max_prompt_length must be positive")
+    max_tokens = int(getattr(args, "max_tokens", 96))
+    if args.max_prompt_length + max_tokens > args.max_model_len:
+        raise ValueError(
+            "invalid context contract: max_prompt_length + max_tokens must be <= max_model_len "
+            f"({args.max_prompt_length} + {max_tokens} > {args.max_model_len})"
+        )
     args._runtime_profile_path = str(config_path)
     return profile
 
@@ -272,7 +294,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     # values into the native ``data``, ``trainer`` and actor/rollout paths.
     set_value("rllm.data.train_batch_size", 1)
     set_value("rllm.data.val_batch_size", -1)
-    set_value("rllm.data.max_prompt_length", 512)
+    set_value("rllm.data.max_prompt_length", args.max_prompt_length)
     set_value("rllm.data.max_response_length", max_response_length)
     set_value("rllm.data.seed", args.seed)
     set_value("rllm.rollout.n", args.group_size)
@@ -328,7 +350,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("rollout.n_gpus_per_node", 1)
 
     set_value("data.train_batch_size", 1)
-    set_value("data.max_prompt_length", 512)
+    set_value("data.max_prompt_length", args.max_prompt_length)
     set_value("data.max_response_length", max_response_length)
     set_value("data.trust_remote_code", False)
     set_value("actor_rollout_ref.rollout.name", args.rollout_engine)
@@ -339,7 +361,7 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.rollout.top_k", -1)
     set_value("actor_rollout_ref.rollout.do_sample", True)
     set_value("actor_rollout_ref.rollout.response_length", max_response_length)
-    set_value("actor_rollout_ref.rollout.prompt_length", 512)
+    set_value("actor_rollout_ref.rollout.prompt_length", args.max_prompt_length)
     set_value("actor_rollout_ref.rollout.calculate_log_probs", True)
     set_value("actor_rollout_ref.rollout.n_gpus_per_node", 1)
     set_value("actor_rollout_ref.rollout.nnodes", 1)
@@ -377,6 +399,10 @@ def _compose_config(args: argparse.Namespace, output: Path) -> Any:
     set_value("actor_rollout_ref.rollout.multi_turn.enable", False)
     set_value("actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu", 1)
     set_value("actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu", 1)
+    set_value("tracesearch.max_prompt_length", args.max_prompt_length, force_add=True)
+    set_value("tracesearch.max_model_len", args.max_model_len, force_add=True)
+    set_value("tracesearch.max_tokens", args.max_tokens, force_add=True)
+    set_value("runtime.max_prompt_length", args.max_prompt_length, force_add=True)
 
     set_value("actor_rollout_ref.model.path", str(args.model))
     # The unified config carries a separate reference-model path.  Leaving its
@@ -449,7 +475,10 @@ def _register_dataset(tasks: list[Any], phase: str) -> Any:
     from rllm.data import DatasetRegistry
 
     name = f"tracesearch_m1c_{phase}_{os.getpid()}"
-    rows = [task.to_dict() for task in tasks]
+    # rLLM's interleave_tasks() uses row["id"] and otherwise falls back to a
+    # fresh UUID. Keep the canonical Task schema unchanged and add the stable
+    # adapter identity only at this boundary.
+    rows = [{"id": task.task_id, **task.to_dict()} for task in tasks]
     return DatasetRegistry.register_dataset(
         name,
         rows,
@@ -733,6 +762,130 @@ def _parameter_evidence(output: Path) -> dict[str, Any]:
     }
 
 
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    rows.append(value)
+    return rows
+
+
+def _termination_diagnostics(output: Path) -> dict[str, Any]:
+    categories = {
+        "answer": [],
+        "max_turns": [],
+        "max_prompt_length_exceeded": [],
+        "max_response_length_exceeded": [],
+        "policy_parse_failure": [],
+        "tool_failure": [],
+        "backend_failure": [],
+        "other_bounded_termination": [],
+    }
+    rows = _read_jsonl(output / "tracesearch_rollouts.jsonl")
+    for row in rows:
+        trajectory = row.get("trajectory") or {}
+        steps = trajectory.get("steps") or []
+        rollout_id = str(row.get("rollout_id", ""))
+        backend_reasons = [
+            str(step.get("metadata", {}).get("backend_termination_reason"))
+            for step in steps
+            if step.get("metadata", {}).get("backend_termination_reason")
+        ]
+        if "max_prompt_length_exceeded" in backend_reasons:
+            category = "max_prompt_length_exceeded"
+        elif "max_response_length_exceeded" in backend_reasons:
+            category = "max_response_length_exceeded"
+        elif any(step.get("metadata", {}).get("parse_failure_type") for step in steps):
+            category = "policy_parse_failure"
+        elif any(
+            (step.get("tool_result") or {}).get("error_type")
+            or step.get("metadata", {}).get("failure_class") == "environment_error"
+            for step in steps
+        ):
+            category = "tool_failure"
+        elif trajectory.get("termination_reason") == "answer":
+            category = "answer"
+        elif trajectory.get("termination_reason") in {"max_turns", "tool_budget_exhausted"}:
+            category = "max_turns"
+        elif any(step.get("metadata", {}).get("failure_class") in {"backend_error", "backend_failure"} for step in steps):
+            category = "backend_failure"
+        else:
+            category = "other_bounded_termination"
+        categories[category].append(rollout_id)
+    return {
+        "schema_version": "m1c.termination-diagnostics.v1",
+        "rollout_count": len(rows),
+        "categories": {
+            name: {"count": len(rollout_ids), "rollout_ids": rollout_ids}
+            for name, rollout_ids in categories.items()
+        },
+    }
+
+
+def _linear_percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _context_budget_summary(output: Path, *, max_prompt_length: int, max_tokens: int, max_model_len: int) -> dict[str, Any]:
+    context_rows = _read_jsonl(output / "context_budget.jsonl")
+    rollout_rows = _read_jsonl(output / "tracesearch_rollouts.jsonl")
+    rewards = {str(row.get("rollout_id")): float((row.get("reward") or {}).get("total", 0.0)) for row in rollout_rows}
+    by_rollout: dict[str, list[dict[str, Any]]] = {}
+    for row in context_rows:
+        by_rollout.setdefault(str(row.get("rollout_id", "")), []).append(row)
+    per_rollout: list[dict[str, Any]] = []
+    prompt_maxima: list[float] = []
+    for rollout_id, rows in sorted(by_rollout.items()):
+        prompt_values = [float(row["prompt_token_count"]) for row in rows if row.get("prompt_token_count") is not None]
+        response_values = [int(row["response_token_count"]) for row in rows if row.get("response_token_count") is not None]
+        observation_values = [int(row["observation_growth_tokens"]) for row in rows if row.get("observation_growth_tokens") is not None]
+        exact_observations = len(observation_values) == len(rows)
+        termination = next((row.get("termination_reason") for row in reversed(rows) if row.get("termination_reason")), None)
+        if prompt_values:
+            prompt_maxima.append(max(prompt_values))
+        per_rollout.append(
+            {
+                "rollout_id": rollout_id,
+                "max_prompt_tokens_seen": max(prompt_values) if prompt_values else None,
+                "total_generated_tokens": sum(response_values) if len(response_values) == len(rows) else None,
+                "total_observation_growth_tokens": sum(observation_values) if exact_observations else None,
+                "turn_count": len(rows),
+                "termination_reason": termination,
+                "reward": rewards.get(rollout_id),
+            }
+        )
+    rollout_count = len(per_rollout)
+    prompt_limit_count = sum(item["termination_reason"] == "max_prompt_length_exceeded" for item in per_rollout)
+    answer_count = sum(item["termination_reason"] == "answer" for item in per_rollout)
+    return {
+        "schema_version": "m1c.context-budget-summary.v1",
+        "configured_max_prompt_length": max_prompt_length,
+        "configured_max_generation_tokens": max_tokens,
+        "configured_max_model_len": max_model_len,
+        "per_rollout": per_rollout,
+        "aggregate": {
+            "prompt_length_p50": _linear_percentile(prompt_maxima, 0.50),
+            "prompt_length_p90": _linear_percentile(prompt_maxima, 0.90),
+            "prompt_length_max": max(prompt_maxima) if prompt_maxima else None,
+            "context_limit_termination_rate": prompt_limit_count / rollout_count if rollout_count else 0.0,
+            "answer_termination_rate": answer_count / rollout_count if rollout_count else 0.0,
+            "reward_vector": [item["reward"] for item in per_rollout],
+        },
+    }
+
+
 def _observer_batches(output: Path, observer: RuntimeTrainingObserver | None) -> list[dict[str, Any]]:
     batches = list(observer.records) if observer is not None else []
     observer_path = output / "training_observer.json"
@@ -903,7 +1056,8 @@ def _write_artifacts(
             "presence_penalty": 0.0,
             "repetition_penalty": 1.0,
             "disable_thinking": True,
-            "rollout_seed": "base_seed + sample_index",
+            "sampling_seed_scheme": "v2:blake2b(base_seed,task_id,sample_index,step_index)",
+            "rollout_seed": "base_seed; policy derives task_id/sample_index/step_index",
         },
         "algorithm_contract": {
             "estimator": "grpo",
@@ -924,6 +1078,8 @@ def _write_artifacts(
         "group_size": args.group_size,
         "max_turns": args.max_turns,
         "max_tokens": args.max_tokens,
+        "max_prompt_length": args.max_prompt_length,
+        "max_model_len": args.max_model_len,
         "runtime_optimizations": {
             "c0_batch_end_weight_sync": c0_batch_weight_sync,
             "cpu_offload_gb": args.cpu_offload_gb,
@@ -939,7 +1095,25 @@ def _write_artifacts(
     _write_json(output / "flash_attn_provenance.json", versions.get("flash_attn_provenance", {}))
     _write_json(output / "mask_parity.json", _mask_parity())
     _write_json(output / "advantage_parity.json", _advantage_parity())
+    _write_json(
+        output / "tokenizer_prompt_parity.json",
+        {
+            "status": "not_applicable",
+            "reason": "C1.2 uses backend ModelOutput.prompt_ids directly; no local preflight tokenizer is used for budgeting.",
+            "comparison_count": 0,
+        },
+    )
     summary = _summarize_rollouts(output, tasks, args.group_size, args.phase)
+    _write_json(output / "termination_diagnostics.json", _termination_diagnostics(output))
+    _write_json(
+        output / "context_budget_summary.json",
+        _context_budget_summary(
+            output,
+            max_prompt_length=args.max_prompt_length,
+            max_tokens=args.max_tokens,
+            max_model_len=args.max_model_len,
+        ),
+    )
     metrics = _runtime_metrics(output, args, observer)
     metrics.update(
         {
@@ -987,6 +1161,8 @@ def _write_artifacts(
                 f"- Observed optimizer steps: `{metrics['observed_optimizer_steps']}`",
                 f"- C0 batch-end weight sync: `{c0_batch_weight_sync}`",
                 f"- Rollout slots: `{summary['completed_rollout_slots']}/{summary['denominator']}`",
+                f"- Sampling seed scheme: `v2:blake2b(base_seed,task_id,sample_index,step_index)`",
+                f"- Prompt budget: `{args.max_prompt_length}` / model length `{args.max_model_len}`",
                 f"- Mean exact match: `{summary['mean_exact_match']}`",
                 f"- Group exact-match variance: `{summary['group_exact_match_variance']}`",
                 "- Reward: normalized exact match only; no process reward, KL, rejection sampling, or fatal-aware shaping.",
@@ -1027,6 +1203,27 @@ def run(args: argparse.Namespace) -> int:
         tasks, provenance = _load_tasks(Path(args.dataset), args.task_count, args.task_id)
         config = _compose_config(args, output)
         _write_json(output / "resolved_config.json", __import__("omegaconf").OmegaConf.to_container(config, resolve=False))
+        _write_json(
+            output / "sampling_seed_table.json",
+            {
+                "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
+                "base_seed": args.seed,
+                "group_size": args.group_size,
+                "max_turns": args.max_turns,
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "rows": sampling_seed_table(
+                            task.task_id,
+                            args.group_size,
+                            args.max_turns,
+                            base_seed=args.seed,
+                        ),
+                    }
+                    for task in tasks
+                ],
+            },
+        )
         _write_run_status(output, "running", phase=args.phase, task_count=len(tasks), group_size=args.group_size)
 
         from importlib import import_module
@@ -1057,6 +1254,8 @@ def run(args: argparse.Namespace) -> int:
                 "top_k_sampling": None,
                 "artifact_dir": str(output),
                 "disable_thinking": True,
+                "max_prompt_length": args.max_prompt_length,
+                "max_model_len": args.max_model_len,
             },
         )
         if args.phase == "c0":

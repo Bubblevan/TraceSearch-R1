@@ -1,5 +1,6 @@
 from tracesearch.agent.loop import SearchAgent, exception_to_tool_error_type
 from tracesearch.agent.llm import (
+    SAMPLING_SEED_SCHEME,
     LLMGenerationConfig,
     ModelClient,
     ModelClientError,
@@ -8,6 +9,7 @@ from tracesearch.agent.llm import (
     TransformersModelClient,
     derive_sampling_seed,
     gather_response_logprobs,
+    sampling_seed_table,
 )
 from tracesearch.agent.parser import (
     ActionParseError,
@@ -44,7 +46,9 @@ __all__ = [
     "OpenAICompatibleClient",
     "TransformersModelClient",
     "derive_sampling_seed",
+    "SAMPLING_SEED_SCHEME",
     "gather_response_logprobs",
+    "sampling_seed_table",
     "ActionParseError",
     "ParseFailureType",
     "ParsedPolicyOutput",

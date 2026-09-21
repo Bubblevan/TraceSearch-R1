@@ -9,8 +9,10 @@ from tracesearch.agent import (
     LLMPolicy,
     ModelGeneration,
     SearchAgent,
+    SAMPLING_SEED_SCHEME,
     derive_sampling_seed,
     gather_response_logprobs,
+    sampling_seed_table,
 )
 from tracesearch.data import Step, Task, Trajectory
 from tracesearch.environment import StaticSearchTool, StaticVisitTool
@@ -132,6 +134,52 @@ def test_sampling_seed_is_identity_stable():
     different = derive_sampling_seed("task", "rollout-b", 1, 1, base_seed=42)
     assert left == right
     assert left != different
+
+
+def test_sampling_seed_v2_ignores_transient_rollout_id():
+    left = derive_sampling_seed("task", "rollout-a", 0, 1, base_seed=42)
+    right = derive_sampling_seed("task", "rollout-b", 0, 1, base_seed=42)
+    assert left == right
+    assert SAMPLING_SEED_SCHEME == "v2:blake2b(base_seed,task_id,sample_index,step_index)"
+
+
+def test_sampling_seed_table_is_process_independent_and_index_sensitive():
+    first = sampling_seed_table("task", 2, 3, base_seed=42)
+    second = sampling_seed_table("task", 2, 3, base_seed=42)
+    assert first == second
+    assert len(first) == 6
+    assert first[0]["derived_sampling_seed"] != first[3]["derived_sampling_seed"]
+    assert first[0]["derived_sampling_seed"] != first[1]["derived_sampling_seed"]
+
+
+def test_llm_policy_sampling_does_not_depend_on_rollout_uuid():
+    class CaptureClient:
+        def __init__(self):
+            self.seeds = []
+
+        async def generate(self, messages, *, model, config):
+            del messages, model
+            self.seeds.append(config.sampling_seed)
+            return ModelGeneration(
+                "<think>answer</think><answer>yes</answer>",
+                token_ids=(7,),
+                prompt_token_ids=(1,),
+                sampling_seed=config.sampling_seed,
+            )
+
+    client = CaptureClient()
+    policy = LLMPolicy(
+        client,
+        model="fake",
+        generation=LLMGenerationConfig(sampling_seed=42),
+        require_token_ids=True,
+    )
+    task = Task("task", "Question", ["yes"], "dev")
+    first = Trajectory(task.question, task_id=task.task_id, rollout_id="uuid-a", sample_index=1)
+    second = Trajectory(task.question, task_id=task.task_id, rollout_id="uuid-b", sample_index=1)
+    asyncio.run(policy.act(task, first))
+    asyncio.run(policy.act(task, second))
+    assert client.seeds[0] == client.seeds[1]
 
 
 def test_logprob_gather_uses_supplied_response_ids():

@@ -6,7 +6,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
-from tracesearch.agent.llm import LLMGenerationConfig, ModelClient, derive_sampling_seed
+from tracesearch.agent.llm import (
+    SAMPLING_SEED_SCHEME,
+    LLMGenerationConfig,
+    ModelClient,
+    derive_sampling_seed,
+)
 from tracesearch.agent.parser import ActionParseError, parse_policy_output
 from tracesearch.data.schema import Action, ActionKind, Task, Trajectory
 
@@ -116,17 +121,24 @@ class LLMPolicy:
         messages = self._messages(policy_task, trajectory)
         sampling_seed = derive_sampling_seed(
             task.task_id,
-            trajectory.rollout_id or "",
             trajectory.sample_index,
             len(trajectory.steps),
             base_seed=self.generation.sampling_seed,
         )
         generation_config = replace(self.generation, sampling_seed=sampling_seed)
-        generation = await self.client.generate(
-            messages,
-            model=self.model,
-            config=generation_config,
-        )
+        try:
+            generation = await self.client.generate(
+                messages,
+                model=self.model,
+                config=generation_config,
+            )
+        except Exception as exc:
+            # A backend termination can happen before prompt IDs are returned.
+            # Preserve the exact attempted seed without fabricating token counts.
+            exc.sampling_seed = sampling_seed  # type: ignore[attr-defined]
+            exc.sampling_seed_scheme = SAMPLING_SEED_SCHEME  # type: ignore[attr-defined]
+            exc.generation_step_index = len(trajectory.steps)  # type: ignore[attr-defined]
+            raise
         record = self._generation_record(trajectory, messages, generation, generation_config)
         if self.require_token_ids and generation.token_ids is None:
             error = RuntimeError("model gateway did not return actual response token IDs")
@@ -148,6 +160,7 @@ class LLMPolicy:
             "repetition_penalty": generation_config.repetition_penalty,
             "enable_thinking": generation_config.enable_thinking,
             "sampling_seed": generation.sampling_seed if generation.sampling_seed is not None else sampling_seed,
+            "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
             "max_generation_tokens": generation_config.max_tokens,
             "stop_sequences": list(generation_config.stop_sequences),
             "mode": self.mode,
@@ -178,6 +191,7 @@ class LLMPolicy:
         if generation.token_ids is None:
             raise RuntimeError("generation record requires actual response token IDs")
         metadata = dict(generation.metadata)
+        metadata.setdefault("sampling_seed_scheme", SAMPLING_SEED_SCHEME)
         sampling_config = dict(metadata.get("sampling_config", {}))
         if not sampling_config:
             sampling_config = {

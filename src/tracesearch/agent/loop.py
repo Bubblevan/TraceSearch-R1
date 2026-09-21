@@ -125,6 +125,12 @@ class SearchAgent:
                 failure_type = getattr(exc, "failure_type", None)
                 if failure_type is not None:
                     policy_metadata["parse_failure_type"] = getattr(failure_type, "value", str(failure_type))
+                attempted_seed = getattr(exc, "sampling_seed", None)
+                if attempted_seed is not None:
+                    policy_metadata["sampling_seed"] = int(attempted_seed)
+                seed_scheme = getattr(exc, "sampling_seed_scheme", None)
+                if seed_scheme is not None:
+                    policy_metadata["sampling_seed_scheme"] = str(seed_scheme)
                 generation_record = getattr(exc, "generation_record", None)
                 if generation_record is not None:
                     policy_metadata["generation_record"] = generation_record.to_dict()

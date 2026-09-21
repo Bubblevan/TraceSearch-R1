@@ -1,5 +1,7 @@
 from argparse import Namespace
 import json
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ from tracesearch.cli.run_m1c_backend import (
     _c1_status,
     _checkpoint_delta_evidence,
     _load_tasks,
+    _register_dataset,
     _prepare_output,
     _runtime_metrics,
 )
@@ -17,6 +20,7 @@ from tracesearch.data.schema import Action, ActionKind, Step, TerminationReason,
 from tracesearch.training.m1c_observer import RuntimeTrainingObserver
 from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
 from tracesearch.training.rllm_workflow import _rllm_termination_value
+from tracesearch.training.rllm_workflow import TraceSearchWorkflow
 
 
 def test_owned_runtime_profile_changes_composed_inputs():
@@ -33,6 +37,20 @@ def test_owned_runtime_profile_changes_composed_inputs():
     assert args.enforce_eager is False
     assert args.tensor_model_parallel_size == 1
     assert args.max_model_len == 1024
+    assert args.max_prompt_length == 896
+
+
+def test_prompt_budget_invariant_rejects_hidden_overflow():
+    args = Namespace(
+        config="configs/m1/runtime/4090-16g-wsl.yaml",
+        gpu_memory_utilization=None,
+        cpu_offload_gb=None,
+        enforce_eager=None,
+        max_prompt_length=929,
+        max_tokens=96,
+    )
+    with pytest.raises(ValueError, match=r"max_prompt_length \+ max_tokens"):
+        _apply_runtime_profile(args)
 
 
 def test_c0_sync_guard_rejects_c1_before_patching():
@@ -104,6 +122,79 @@ def test_stale_output_requires_explicit_overwrite(tmp_path: Path):
 def test_task_id_selector_is_exact():
     tasks, _ = _load_tasks(Path("data/m1/dev.jsonl"), task_count=3, task_id="m1-two-hop")
     assert [task.task_id for task in tasks] == ["m1-two-hop"]
+
+
+def test_rllm_dataset_adapter_adds_stable_id_without_changing_task_schema(monkeypatch):
+    captured = {}
+
+    class Registry:
+        @staticmethod
+        def register_dataset(name, rows, **kwargs):
+            captured.update(name=name, rows=rows, kwargs=kwargs)
+            return "registered"
+
+    rllm_module = types.ModuleType("rllm")
+    data_module = types.ModuleType("rllm.data")
+    data_module.DatasetRegistry = Registry
+    rllm_module.data = data_module
+    monkeypatch.setitem(sys.modules, "rllm", rllm_module)
+    monkeypatch.setitem(sys.modules, "rllm.data", data_module)
+
+    task = _load_tasks(Path("data/m1/dev.jsonl"), task_count=3, task_id="m1-two-hop")[0][0]
+    assert _register_dataset([task], "c1") == "registered"
+    assert captured["rows"][0]["id"] == "m1-two-hop"
+    assert captured["rows"][0]["task_id"] == "m1-two-hop"
+
+
+def test_context_telemetry_uses_backend_prompt_ids_without_retokenizing(tmp_path: Path):
+    workflow = object.__new__(TraceSearchWorkflow)
+    workflow.artifact_dir = tmp_path
+    workflow.seed = 42
+    workflow.max_prompt_length = 896
+    workflow.max_tokens = 96
+    workflow.max_model_len = 1024
+    task = SimpleNamespace(task_id="task")
+    trajectory = Trajectory(
+        question="q",
+        task_id="task",
+        rollout_id="task:0",
+        sample_index=0,
+        termination_reason=TerminationReason.ANSWER,
+        steps=[
+            Step(
+                thought="",
+                action=Action(ActionKind.SEARCH, "q"),
+                step_index=0,
+                metadata={
+                    "generation_record": {
+                        "prompt_ids": [1, 2],
+                        "response_ids": [3, 4],
+                        "sampling_seed": 11,
+                        "prompt_fingerprint": "p0",
+                    }
+                },
+            ),
+            Step(
+                thought="",
+                action=Action(ActionKind.ANSWER, "yes"),
+                step_index=1,
+                metadata={
+                    "generation_record": {
+                        "prompt_ids": [1, 2, 3, 4, 5],
+                        "response_ids": [6],
+                        "sampling_seed": 12,
+                        "prompt_fingerprint": "p1",
+                    }
+                },
+            ),
+        ],
+    )
+    workflow._write_sampling_and_context_artifacts(task, trajectory, "task:0", 0)
+    rows = [json.loads(line) for line in (tmp_path / "context_budget.jsonl").read_text().splitlines()]
+    assert rows[0]["prompt_token_count"] == 2
+    assert rows[1]["prompt_token_count"] == 5
+    assert rows[1]["observation_growth_tokens"] == 1
+    assert rows[1]["prompt_token_count_provenance"] == "backend_model_output.prompt_ids"
 
 
 def _fake_trajectory(uid: str, reward: float = 1.0):

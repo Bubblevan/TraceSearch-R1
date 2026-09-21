@@ -13,7 +13,12 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from tracesearch.agent.llm import LLMGenerationConfig, ModelGeneration
+from tracesearch.agent.llm import (
+    SAMPLING_SEED_SCHEME,
+    LLMGenerationConfig,
+    ModelGeneration,
+    derive_sampling_seed,
+)
 from tracesearch.agent.policy import LLMPolicy
 from tracesearch.agent.loop import SearchAgent
 from tracesearch.data.io import load_corpus
@@ -203,6 +208,7 @@ class RLLMModelClient:
                     "enable_thinking": not self.disable_thinking,
                     "max_tokens": config.max_tokens,
                 },
+                "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
             },
         )
 
@@ -226,6 +232,8 @@ class TraceSearchWorkflow(_RLLMWorkflow):
         top_k_sampling: int | None = None,
         artifact_dir: str | None = None,
         disable_thinking: bool = True,
+        max_prompt_length: int = 896,
+        max_model_len: int = 1024,
         **kwargs: Any,
     ) -> None:
         if _RLLMModelOutput is None:
@@ -242,6 +250,8 @@ class TraceSearchWorkflow(_RLLMWorkflow):
         self.top_k_sampling = top_k_sampling
         self.artifact_dir = Path(artifact_dir) if artifact_dir else None
         self.disable_thinking = bool(disable_thinking)
+        self.max_prompt_length = int(max_prompt_length)
+        self.max_model_len = int(max_model_len)
         self._environment = LocalSearchEnvironment(Corpus(load_corpus(self.corpus_path)), top_k=self.top_k)
 
     async def run(self, task: dict[str, Any], uid: str, **kwargs: Any) -> Any:
@@ -256,9 +266,10 @@ class TraceSearchWorkflow(_RLLMWorkflow):
             presence_penalty=0.0,
             repetition_penalty=1.0,
             enable_thinking=not self.disable_thinking,
-            # Keep the base experiment seed fixed while giving each member of
-            # a task group a stable, distinct sampling stream.
-            sampling_seed=self.seed + sample_index,
+            # LLMPolicy owns the single per-rollout/per-turn derivation.  Keep
+            # only the experiment base seed here to avoid double-encoding the
+            # sample index.
+            sampling_seed=self.seed,
             max_tokens=self.max_tokens,
         )
         policy = LLMPolicy(
@@ -382,6 +393,7 @@ class TraceSearchWorkflow(_RLLMWorkflow):
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         row = {
             "task_id": task.task_id,
+            "rllm_group_id": task.task_id,
             "rollout_id": uid,
             "sample_index": sample_index,
             "reward": reward,
@@ -392,6 +404,138 @@ class TraceSearchWorkflow(_RLLMWorkflow):
         with _LOG_LOCK:
             with destination.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
+            self._write_sampling_and_context_artifacts(task, trajectory, uid, sample_index)
+
+    def _write_sampling_and_context_artifacts(
+        self,
+        task: Task,
+        trajectory: Trajectory,
+        uid: str,
+        sample_index: int,
+    ) -> None:
+        """Persist exact seed attempts and backend-provided prompt telemetry."""
+
+        if self.artifact_dir is None:
+            return
+        seed_rows: list[dict[str, Any]] = []
+        context_rows: list[dict[str, Any]] = []
+        records_by_step: dict[int, dict[str, Any]] = {}
+        for step in trajectory.steps:
+            raw = step.metadata.get("generation_record")
+            if isinstance(raw, dict):
+                records_by_step[int(step.step_index)] = raw
+
+        previous_prompt_ids: tuple[int, ...] | None = None
+        previous_response_ids: tuple[int, ...] | None = None
+        cumulative_policy_tokens = 0
+        cumulative_observation_tokens = 0
+        policy_tokens_exact = True
+        observation_tokens_exact = True
+        for step in trajectory.steps:
+            step_index = int(step.step_index)
+            raw = records_by_step.get(step_index)
+            derived_seed = derive_sampling_seed(
+                task.task_id,
+                sample_index,
+                step_index,
+                base_seed=self.seed,
+            )
+            actual_seed = int(raw["sampling_seed"]) if raw and raw.get("sampling_seed") is not None else derived_seed
+            seed_rows.append(
+                {
+                    "task_id": task.task_id,
+                    "rllm_group_id": task.task_id,
+                    "rollout_id": uid,
+                    "sample_index": sample_index,
+                    "base_seed": self.seed,
+                    "step_index": step_index,
+                    "derived_sampling_seed": actual_seed,
+                    "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
+                }
+            )
+
+            prompt_raw = raw.get("prompt_ids") if raw else None
+            response_raw = raw.get("response_ids") if raw else None
+            prompt_ids = tuple(int(value) for value in prompt_raw) if prompt_raw is not None else None
+            response_ids = tuple(int(value) for value in response_raw) if response_raw is not None else None
+            prompt_count = len(prompt_ids) if prompt_ids is not None else None
+            response_count = len(response_ids) if response_ids is not None else None
+            previous_prompt_count = len(previous_prompt_ids) if previous_prompt_ids is not None else None
+            prompt_growth = (
+                prompt_count - previous_prompt_count
+                if prompt_count is not None and previous_prompt_count is not None
+                else None
+            )
+            observation_growth: int | None = None
+            prompt_provenance = "backend_model_output.prompt_ids"
+            if prompt_ids is None:
+                prompt_provenance = "unavailable: backend termination before prompt_ids"
+            elif previous_prompt_ids is None:
+                observation_growth = 0
+            elif previous_response_ids is not None:
+                prefix = previous_prompt_ids + previous_response_ids
+                if prompt_ids[: len(prefix)] == prefix:
+                    observation_growth = len(prompt_ids) - len(prefix)
+                else:
+                    prompt_provenance = "unavailable: prompt prefix did not match prior generation"
+            if response_count is None:
+                policy_tokens_exact = False
+            else:
+                cumulative_policy_tokens += response_count
+            if observation_growth is None and step_index > 0:
+                observation_tokens_exact = False
+            elif observation_growth is not None:
+                cumulative_observation_tokens += observation_growth
+
+            backend_reason = step.metadata.get("backend_termination_reason")
+            termination_reason = str(backend_reason) if backend_reason else None
+            if step is trajectory.steps[-1]:
+                termination_reason = termination_reason or trajectory.termination_reason.value
+            context_rows.append(
+                {
+                    "task_id": task.task_id,
+                    "rollout_id": uid,
+                    "sample_index": sample_index,
+                    "step_index": step_index,
+                    "prompt_token_count": prompt_count,
+                    "response_token_count": response_count,
+                    "previous_prompt_token_count": previous_prompt_count,
+                    "prompt_growth_tokens": prompt_growth,
+                    "observation_growth_tokens": observation_growth,
+                    "cumulative_policy_tokens": cumulative_policy_tokens if policy_tokens_exact else None,
+                    "cumulative_observation_tokens": cumulative_observation_tokens if observation_tokens_exact else None,
+                    "configured_max_prompt_length": self.max_prompt_length,
+                    "configured_max_generation_tokens": self.max_tokens,
+                    "configured_max_model_len": self.max_model_len,
+                    "prompt_budget_utilization": (
+                        prompt_count / self.max_prompt_length
+                        if prompt_count is not None and self.max_prompt_length
+                        else None
+                    ),
+                    "termination_reason": termination_reason,
+                    "derived_sampling_seed": actual_seed,
+                    "sampling_seed_scheme": SAMPLING_SEED_SCHEME,
+                    "prompt_token_count_provenance": prompt_provenance,
+                    "prompt_fingerprint": raw.get("prompt_fingerprint") if raw else None,
+                    "response_token_count_provenance": (
+                        "backend_model_output.completion_ids"
+                        if response_ids is not None
+                        else "unavailable: backend termination before completion_ids"
+                    ),
+                }
+            )
+            if prompt_ids is not None:
+                previous_prompt_ids = prompt_ids
+            if response_ids is not None:
+                previous_response_ids = response_ids
+
+        def append(path: Path, rows: list[dict[str, Any]]) -> None:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                for value in rows:
+                    handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+
+        append(self.artifact_dir / "sampling_seeds.jsonl", seed_rows)
+        append(self.artifact_dir / "context_budget.jsonl", context_rows)
 
     @staticmethod
     def _split_uid(uid: str, fallback_task_id: str) -> tuple[str, int]:

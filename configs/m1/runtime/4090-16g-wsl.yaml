@@ -10,6 +10,8 @@ runtime:
   enforce_eager: false
   tensor_model_parallel_size: 1
   max_model_len: 1024
+  # C1.2 controlled context budget: 896 + 96 leaves a 32-token reserve.
+  max_prompt_length: 896
   max_num_batched_tokens: 4096
 
 model:

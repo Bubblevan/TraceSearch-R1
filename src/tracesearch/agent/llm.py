@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
+SAMPLING_SEED_SCHEME = "v2:blake2b(base_seed,task_id,sample_index,step_index)"
+
+
 @dataclass(frozen=True)
 class LLMGenerationConfig:
     temperature: float = 0.0
@@ -51,24 +54,66 @@ class ModelGeneration:
 
 def derive_sampling_seed(
     task_id: str,
-    rollout_id: str,
-    sample_index: int,
+    sample_index: int | str,
     step_index: int,
-    *,
+    legacy_step_index: int | None = None,
     base_seed: int | None = None,
+    rollout_id: str | None = None,
 ) -> int:
-    """Derive a stable per-generation seed from rollout identity."""
+    """Derive the v2 per-generation seed without transport identity.
 
+    The canonical call is ``derive_sampling_seed(task_id, sample_index,
+    step_index, base_seed=...)``.  The three-positional-argument form is
+    retained as a compatibility shim for the M1-B API; its rollout id is
+    deliberately ignored so runtime UUIDs cannot change model sampling.
+    """
+
+    del rollout_id
+    if legacy_step_index is not None:
+        # Legacy form: (task_id, rollout_id, sample_index, step_index).
+        sample_index, step_index = step_index, legacy_step_index
+    if not isinstance(sample_index, int) or sample_index < 0:
+        raise ValueError("sample_index must be a non-negative integer")
+    if not isinstance(step_index, int) or step_index < 0:
+        raise ValueError("step_index must be a non-negative integer")
     material = "|".join(
         (
             str(base_seed if base_seed is not None else 0),
-            task_id,
-            rollout_id,
+            str(task_id),
             str(sample_index),
             str(step_index),
         )
     ).encode("utf-8")
     return int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), "big") & 0x7FFFFFFF
+
+
+def sampling_seed_table(
+    task_id: str,
+    group_size: int,
+    max_turns: int,
+    *,
+    base_seed: int,
+) -> list[dict[str, int | str]]:
+    """Return the complete deterministic seed table before model execution."""
+
+    if group_size < 1 or max_turns < 1:
+        raise ValueError("group_size and max_turns must be positive")
+    return [
+        {
+            "task_id": task_id,
+            "sample_index": sample_index,
+            "step_index": step_index,
+            "base_seed": base_seed,
+            "derived_sampling_seed": derive_sampling_seed(
+                task_id,
+                sample_index,
+                step_index,
+                base_seed=base_seed,
+            ),
+        }
+        for sample_index in range(group_size)
+        for step_index in range(max_turns)
+    ]
 
 
 def gather_response_logprobs(
