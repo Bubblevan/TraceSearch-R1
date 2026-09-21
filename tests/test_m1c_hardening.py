@@ -223,6 +223,29 @@ def test_policy_backend_failure_remains_fatal():
     assert _rllm_termination_value(trajectory) == "error"
 
 
+@pytest.mark.parametrize(
+    "backend_reason",
+    ["max_prompt_length_exceeded", "max_response_length_exceeded", "timeout"],
+)
+def test_bounded_backend_termination_is_a_nonfatal_negative(backend_reason: str):
+    trajectory = Trajectory(
+        question="q",
+        termination_reason=TerminationReason.POLICY_ERROR,
+        steps=[
+            Step(
+                thought="",
+                action=Action(ActionKind.ANSWER, ""),
+                metadata={
+                    "failure_class": "policy_error",
+                    "exception_class": "TerminationEvent",
+                    "backend_termination_reason": backend_reason,
+                },
+            )
+        ],
+    )
+    assert _rllm_termination_value(trajectory) == backend_reason
+
+
 def test_repository_does_not_shadow_external_flash_attn():
     repo = Path(__file__).resolve().parents[1]
     shadow_root = repo / "src" / "flash_attn"

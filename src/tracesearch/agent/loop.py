@@ -106,7 +106,19 @@ class SearchAgent:
             try:
                 output = await self._ask_policy(task, trajectory)
             except Exception as exc:
-                policy_metadata: dict[str, Any] = {"failure_class": "policy_error"}
+                policy_metadata: dict[str, Any] = {
+                    "failure_class": "policy_error",
+                    "exception_class": type(exc).__name__,
+                }
+                # Optional model backends may signal bounded rollout
+                # termination with an exception carrying an enum-like
+                # ``reason``.  Preserve the structured value without making
+                # the core agent depend on that backend package.
+                backend_reason = getattr(exc, "reason", None)
+                if backend_reason is not None:
+                    policy_metadata["backend_termination_reason"] = str(
+                        getattr(backend_reason, "value", backend_reason)
+                    )
                 raw_output = getattr(exc, "raw_text", None)
                 if raw_output is not None:
                     policy_metadata["policy_raw_output"] = raw_output

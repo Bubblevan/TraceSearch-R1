@@ -108,6 +108,22 @@ def _rllm_termination_value(trajectory: Trajectory) -> str:
 
     reason = trajectory.termination_reason
     if reason is TerminationReason.POLICY_ERROR:
+        backend_termination = next(
+            (
+                str(step.metadata["backend_termination_reason"])
+                for step in reversed(trajectory.steps)
+                if step.metadata.get("backend_termination_reason")
+            ),
+            None,
+        )
+        if backend_termination in {
+            "max_prompt_length_exceeded",
+            "max_response_length_exceeded",
+            "max_turns_exceeded",
+            "timeout",
+            "unknown",
+        }:
+            return backend_termination
         parse_failure = any(
             bool(step.metadata.get("parse_failure_type"))
             and isinstance(step.metadata.get("generation_record"), dict)
@@ -326,6 +342,11 @@ class TraceSearchWorkflow(_RLLMWorkflow):
                     for step in trajectory.steps
                     if step.metadata.get("parse_failure_type")
                 ],
+                "backend_termination_reasons": [
+                    str(step.metadata["backend_termination_reason"])
+                    for step in trajectory.steps
+                    if step.metadata.get("backend_termination_reason")
+                ],
             },
         )
         termination = _rllm_termination_value(trajectory)
@@ -340,6 +361,11 @@ class TraceSearchWorkflow(_RLLMWorkflow):
                 "task_id": task_id,
                 "sample_index": trajectory.sample_index,
                 "tracesearch_termination": trajectory.termination_reason.value,
+                "backend_termination_reasons": [
+                    str(step.metadata["backend_termination_reason"])
+                    for step in trajectory.steps
+                    if step.metadata.get("backend_termination_reason")
+                ],
             },
         )
 

@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+from types import SimpleNamespace
 
 from tracesearch.agent import Action, ActionKind, SearchAgent, Task
 from tracesearch.environment import StaticSearchTool, StaticVisitTool
@@ -34,3 +35,22 @@ class SearchAgentTests(unittest.TestCase):
 
         self.assertEqual(result.termination, "answer")
         self.assertEqual(seen, [([], [])])
+
+    def test_policy_exception_preserves_structured_backend_termination(self):
+        class BackendTermination(Exception):
+            reason = SimpleNamespace(value="max_prompt_length_exceeded")
+
+        class Policy:
+            async def act(self, task, trajectory):
+                del task, trajectory
+                raise BackendTermination("prompt limit")
+
+        agent = SearchAgent(Policy(), StaticSearchTool({}), StaticVisitTool({}))
+        result = asyncio.run(agent.run_async(Task("task-1", "Question", ["answer"], "test")))
+
+        self.assertEqual(result.termination, "policy_error")
+        self.assertEqual(result.steps[-1].metadata["exception_class"], "BackendTermination")
+        self.assertEqual(
+            result.steps[-1].metadata["backend_termination_reason"],
+            "max_prompt_length_exceeded",
+        )
