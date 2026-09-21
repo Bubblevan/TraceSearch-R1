@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import statistics
 import os
 import time
 from pathlib import Path
@@ -112,6 +113,17 @@ def _non_tensor_rows(batch: Any, key: str) -> list[Any]:
     return _as_list(values)
 
 
+def _percentile(values: list[float], quantile: float) -> float:
+    """Return a deterministic linearly interpolated percentile."""
+
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 def _trajectory_segments(trajectory: Any) -> list[dict[str, Any]]:
     """Reconstruct the pinned rLLM cumulative response representation."""
 
@@ -207,10 +219,20 @@ class RuntimeTrainingObserver:
         rollout = _masked_values(batch, "rollout_log_probs")
         if old and rollout and len(old) == len(rollout):
             diffs = [left - right for left, right in zip(old, rollout, strict=True)]
+            mean = statistics.mean(diffs)
             diagnostics = {
-                "masked_mean_old_minus_rollout": sum(diffs) / len(diffs),
-                "max_abs_difference": max(abs(item) for item in diffs),
+                "mean": mean,
+                "std": statistics.pstdev(diffs),
+                "p50": _percentile(diffs, 0.50),
+                "p90": _percentile(diffs, 0.90),
+                "p95": _percentile(diffs, 0.95),
+                "p99": _percentile(diffs, 0.99),
+                "max_abs": max(abs(item) for item in diffs),
                 "token_count": len(diffs),
+                # Retain the original names for compatibility with the first
+                # M1-C proof artifacts.
+                "masked_mean_old_minus_rollout": mean,
+                "max_abs_difference": max(abs(item) for item in diffs),
                 "tis_mode": None,
                 "kl_beta": 0.0,
                 "backend_offpolicy_metrics": {

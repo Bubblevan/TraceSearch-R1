@@ -1,4 +1,5 @@
 from argparse import Namespace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -156,6 +157,29 @@ def test_live_mask_parity_matches_reordered_segments_within_rollout():
     parity = RuntimeTrainingObserver._live_mask_parity(state)
     assert parity["parity"] is True
     assert [row["segment_index"] for row in parity["rows"]] == [1, 0]
+
+
+def test_logprob_diagnostics_persist_distribution(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    observer = RuntimeTrainingObserver(tmp_path, phase="c1")
+    batch = SimpleNamespace(
+        batch={
+            "old_log_probs": torch.tensor([[1.0, 2.0, 9.0, 4.0]]),
+            "rollout_log_probs": torch.tensor([[0.0, 0.0, 9.0, 0.0]]),
+            "response_mask": torch.tensor([[1, 1, 0, 1]]),
+        }
+    )
+    state = SimpleNamespace(backend_batch=batch, metrics={})
+    observer.observe_process_batch(state)
+    record = json.loads((tmp_path / "rollout_logprob_diagnostics.json").read_text())["records"][0]
+    assert record["mean"] == pytest.approx(7 / 3)
+    assert record["std"] == pytest.approx(1.2472191289)
+    assert record["p50"] == pytest.approx(2.0)
+    assert record["p90"] == pytest.approx(3.6)
+    assert record["p95"] == pytest.approx(3.8)
+    assert record["p99"] == pytest.approx(3.96)
+    assert record["max_abs"] == 4.0
+    assert record["token_count"] == 3
 
 
 def test_live_advantage_parity_reads_step_ids_and_sets_zero_signal_gate(tmp_path: Path):
