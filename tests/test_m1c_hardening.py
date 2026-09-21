@@ -12,6 +12,7 @@ from tracesearch.cli.run_m1c_backend import (
     _c1_status,
     _c2_status,
     _checkpoint_delta_evidence,
+    build_parser,
     _load_tasks,
     _register_dataset,
     _prepare_output,
@@ -23,6 +24,16 @@ from tracesearch.training.m1c_observer import M1CProofError, RuntimeTrainingObse
 from tracesearch.training.rllm_optimizations import install_c0_post_batch_weight_sync_skip
 from tracesearch.training.rllm_workflow import _rllm_termination_value
 from tracesearch.training.rllm_workflow import TraceSearchWorkflow
+
+
+def test_weight_transfer_workaround_is_opt_in():
+    parser = build_parser()
+    args = parser.parse_args(["--phase", "c2", "--model", "model", "--output", "out"])
+    assert args.force_shm_weight_transfer is False
+    args = parser.parse_args(
+        ["--phase", "c2", "--model", "model", "--output", "out", "--force-shm-weight-transfer"]
+    )
+    assert args.force_shm_weight_transfer is True
 
 
 def test_owned_runtime_profile_changes_composed_inputs():

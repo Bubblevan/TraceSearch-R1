@@ -81,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Use eager execution in vLLM (use --no-enforce-eager to benchmark CUDA graphs).",
     )
+    parser.add_argument(
+        "--force-shm-weight-transfer",
+        action="store_true",
+        help=(
+            "Use POSIX shared memory for actor-to-vLLM weight transfer instead of CUDA IPC; "
+            "useful on WSL when repeated CUDA IPC handles become invalid."
+        ),
+    )
     return parser
 
 
@@ -91,6 +99,29 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _write_run_status(output: Path, status: str, **extra: Any) -> None:
     _write_json(output / "run_status.json", {"status": status, "updated_at": time.time(), **extra})
+
+
+def _configure_weight_transfer(args: argparse.Namespace) -> str:
+    """Apply the explicit WSL weight-transfer compatibility workaround.
+
+    veRL currently treats every CUDA device as CUDA-IPC capable.  On the
+    single-GPU WSL stack, repeated CUDA IPC rebuilds can eventually fail with
+    ``cudaErrorInvalidValue`` even though ordinary inference and FSDP updates
+    remain healthy.  The upstream receiver already supports POSIX shared
+    memory; force its existing fallback before rLLM imports the rollout
+    module, without changing any training semantics.
+    """
+
+    if not args.force_shm_weight_transfer:
+        return "cuda_ipc_default"
+
+    import verl.utils.device as verl_device
+
+    verl_device.is_support_ipc = lambda: False
+    rollout_module = sys.modules.get("verl.workers.rollout.vllm_rollout.vllm_rollout")
+    if rollout_module is not None:
+        rollout_module.is_support_ipc = lambda: False
+    return "posix_shared_memory_forced"
 
 
 _KNOWN_RUN_ARTIFACTS = (
@@ -1315,6 +1346,7 @@ def _write_artifacts(
         "max_model_len": args.max_model_len,
         "runtime_optimizations": {
             "c0_batch_end_weight_sync": c0_batch_weight_sync,
+            "weight_transfer": getattr(args, "_weight_transfer_mode", "cuda_ipc_default"),
             "cpu_offload_gb": args.cpu_offload_gb,
             "enforce_eager": args.enforce_eager,
             "rollout_engine": args.rollout_engine,
@@ -1438,6 +1470,7 @@ def run(args: argparse.Namespace) -> int:
     # console log remain the source of truth for the actual runtime topology.
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ["TRACESEARCH_M1C_PHASE"] = args.phase
+    args._weight_transfer_mode = _configure_weight_transfer(args)
     if args.phase == "c0":
         # AgentTrainer constructs the real VerlBackend inside its Ray worker;
         # install the post-batch C0 guard from the workflow module there too.
