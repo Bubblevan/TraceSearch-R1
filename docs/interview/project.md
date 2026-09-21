@@ -1,33 +1,33 @@
 # TraceSearch-R1 项目面试追问
 
-> 事实截面：2026-09-19。M0.1 已提交于 Git `a8358424ac5d606e7ac95e486e4af294783a1121`，并已完成 clean checkout 验证。
+> 事实截面：2026-09-21。M0.1/M1-C1 hardening 已提交于 Git `dacf51fd3f47c608956410a0c8cad81056befb83`；C1 已进行真实后端尝试，但因固定 integration group 自然零方差而停止，没有声称发生策略更新。
 >
 > 本文只回答“TraceSearch-R1 当前实际做了什么、为什么这样做、如何证明”。通用的 Search Agent、Agentic RL、credit assignment、系统和多模态知识统一放在 [`bagua.md`](bagua.md)。
 >
-> 状态标签：`[COMMITTED: a835842]` 表示 M0.1 能力已进入提交；`[M1 LEVEL A]` 表示接口、协议和离线测试边界已实现，但不等于真实模型或训练实验；`[LOCAL ARTIFACT, CLEAN-RERUN]` 表示本地产物已从 clean checkout 重跑；`[PLANNED]` 表示设计或路线图中的后续能力。
+> 状态标签：`[COMMITTED: dacf51f]` 表示当前 M0/M1-C1 hardening 已进入提交；`[M1 LEVEL A]` 表示接口、协议和离线测试边界已实现；`[M1-C1 ATTEMPTED]` 表示真实后端已运行但不代表非零学习更新；`[LOCAL ARTIFACT, CLEAN-RERUN]` 表示本地产物已从 clean checkout 重跑；`[PLANNED]` 表示设计或路线图中的后续能力。
 
 ## 先记住的 30 秒版本
 
 TraceSearch-R1 是一个研究多轮 Search Agent 失败传播与 credit assignment 的个人研究/工程项目。当前 M0 不是 RL 训练系统，而是一套可复现的 research substrate：它把 `Task`、policy decision、`search/visit/answer` action、结构化 `ToolResult`、`Step`、`Trajectory`、离线环境、故障注入、指标和 run artifact 分开保存，为后续比较 Search-R1 风格训练、fatal-aware masking 和 contribution-weighted advantage 提供同一实验边界。
 
-当前已经能在小型 synthetic fixture 上运行确定性的 BM25 Search/Visit 环境，保存 manifest、trajectory、metrics 和 summary，并重算答案、证据召回、工具失败与终止指标。M1 又加入了 learned-policy 的文本协议、OpenAI-compatible client、HTTP retriever、token mask、outcome reward、group rollout 和 vanilla GRPO objective 的 Level-A 边界；但当前没有可用文本 checkpoint、rLLM/verl 后端或真实训练结果。`OracleFixturePolicy` 仍只用于 M0 plumbing smoke，不能说明模型学会了搜索。
+当前已经能在小型 synthetic fixture 上运行确定性的 BM25 Search/Visit 环境，保存 manifest、trajectory、metrics 和 summary，并重算答案、证据召回、工具失败与终止指标。M1 又加入了 learned-policy 的文本协议、OpenAI-compatible client、HTTP retriever、token mask、outcome reward、group rollout 和 vanilla GRPO objective 的 Level-A 边界；M1-C1 已在 WSL2 ext4 上用 Qwen2.5-3B-Instruct 跑通真实 rollout、工具交互和 trainer/checkpoint plumbing，但固定 group 自然零方差，因此没有真实非零策略更新。`OracleFixturePolicy` 仍只用于 M0 plumbing smoke，不能说明模型学会了搜索。
 
 ## 面试前的事实纪律
 
 | 能力 | 当前状态 | 证据 | 可以怎么说 |
 | --- | --- | --- | --- |
-| typed Task/Action/ToolResult/Step/Trajectory | `[COMMITTED: a835842]` | `src/tracesearch/data/schema.py` | M0 固定了 policy、environment、evaluator 和未来 trainer 的共享数据边界 |
-| async Search/Visit/Answer loop 与预算终止 | `[COMMITTED: a835842]` | `src/tracesearch/agent/loop.py` | runtime 能执行 sync/async policy 和 tool，并记录结构化轨迹 |
-| 本地 BM25 Search/Visit 环境 | `[COMMITTED: a835842]` | `src/tracesearch/environment/` | 当前默认是 aligned offline fixture，不是 live Web |
-| deterministic fault injection | `[COMMITTED: a835842]` | `environment/faults.py`、`tests/test_faults.py` | 可定点或按 seed 注入 failure，便于做干净消融 |
+| typed Task/Action/ToolResult/Step/Trajectory | `[COMMITTED: dacf51f]` | `src/tracesearch/data/schema.py` | M0 固定了 policy、environment、evaluator 和未来 trainer 的共享数据边界 |
+| async Search/Visit/Answer loop 与预算终止 | `[COMMITTED: dacf51f]` | `src/tracesearch/agent/loop.py` | runtime 能执行 sync/async policy 和 tool，并记录结构化轨迹 |
+| 本地 BM25 Search/Visit 环境 | `[COMMITTED: dacf51f]` | `src/tracesearch/environment/` | 当前默认是 aligned offline fixture，不是 live Web |
+| deterministic fault injection | `[COMMITTED: dacf51f]` | `environment/faults.py`、`tests/test_faults.py` | 可定点或按 seed 注入 failure，便于做干净消融 |
 | manifest/trajectory/metrics/summary | `[LOCAL ARTIFACT, CLEAN-RERUN]` | `runs/m0-*-final/` | 产物链路已从 clean checkout 重跑；manifest 记录 `git_dirty=false` 与 source-tree hash |
-| learned policy、真实 LLM inference | `[M1 LEVEL A]` / `[PLANNED]` | `src/tracesearch/agent/policy.py`、`agent/llm.py` | 协议和 client 已实现；当前没有可用文本 checkpoint 或真实模型 rollout |
-| vanilla GRPO objective / rLLM boundary | `[M1 LEVEL A]` | `src/tracesearch/training/` | objective、token projection 和 conversion boundary 已有；rLLM/verl 未安装，未声称完成训练 |
+| learned policy、真实 LLM inference | `[M1 LEVEL A]` / `[M1-C1 ATTEMPTED]` | `src/tracesearch/agent/policy.py`、`agent/llm.py`、`runs/m1-c1-proof-r2/` | Qwen2.5-3B-Instruct 真实 rollout 与 Search/Visit 已运行；不等于模型质量或训练收益 |
+| vanilla GRPO objective / rLLM boundary | `[M1 LEVEL A]` / `[M1-C1 ATTEMPTED]` | `src/tracesearch/training/`、`runs/m1-c1-proof-r2/` | backend plumbing、mask/advantage 静态证据和 checkpoint save 已验证；该 group 零方差，未完成非零 actor update |
 | fatal-aware training mask | `[PLANNED]` | `rewards/credit.py` 只有 failure index/helper | helper 不等于训练 loss 已接入 |
 | contribution judge / CW-GRPO | `[PLANNED]` | `weighted_advantages` 只有占位式映射 | 没有 judge、过程标注或真实消融 |
 | live Web、multimodal search、memory | `[PLANNED]` | design non-goals | 不能写成当前能力 |
 
-特别注意：旧的 `runs/*/manifest.json` 曾记录 `7273383...`，不能证明当前 M0 可由该提交干净复现。M0.1 已把 dirty 状态和 source tree hash 写入 manifest，并已在 `a835842` 的 clean checkout 上重新执行测试与 CLI。
+特别注意：旧的 `runs/*/manifest.json` 曾记录 `7273383...`，不能证明当前 M0 可由该提交干净复现。M0.1 已把 dirty 状态和 source tree hash 写入 manifest，并已在 `538c683` 的 clean checkout 上重新执行测试与 CLI；当前代码提交为 `dacf51f`。
 
 ## 第一轮：项目定位与整体架构
 
@@ -239,7 +239,7 @@ Execution failure 表示工具没有正常产生结果，例如 timeout、except
 
 #### 当前边界
 
-当前 manifest 同时记录 `git_commit`、`git_dirty` 和 `source_tree_hash`。`a835842` 的 clean checkout rerun 中，manifest 的 `git_dirty` 为 `false`，因此提交状态与实际源码树一致。
+当前 manifest 同时记录 `git_commit`、`git_dirty` 和 `source_tree_hash`。M0.1 的 clean checkout rerun 中，manifest 的 `git_dirty` 为 `false`，因此提交状态与实际源码树一致。
 
 ### Q13：当前 M0 指标能证明什么？
 
@@ -272,7 +272,7 @@ Execution failure 表示工具没有正常产生结果，例如 timeout、except
 
 #### 30 秒回答
 
-当前完成的是 M0 typed trajectory、async loop、本地 Search/Visit、BM25、预算和终止、故障分类与注入、manifest/artifact、离线指标和 synthetic fixture，以及 M1 Level-A 的 learned-policy protocol、NQ-style adapter、HTTP retriever、TrainingTrace/mask、outcome reward、group rollout 和 vanilla GRPO objective。没有完成真实 LLM serving、真实 checkpoint rollout、rLLM/verl backend、Level-B/C 实验、contribution judge、真实 benchmark、live Web 或 multimodal tools。
+当前完成的是 M0 typed trajectory、async loop、本地 Search/Visit、BM25、预算和终止、故障分类与注入、manifest/artifact、离线指标和 synthetic fixture，以及 M1 Level-A 的 learned-policy protocol、NQ-style adapter、HTTP retriever、TrainingTrace/mask、outcome reward、group rollout 和 vanilla GRPO objective。M1-C1 已完成真实 Qwen rollout、工具交互和 trainer/checkpoint plumbing 尝试，但固定 integration group 的 reward 方差为 0，未完成非零 actor update；仍没有真实 benchmark、live Web、multimodal tools 或 reward/credit 改造。
 
 #### 当前边界
 
@@ -290,7 +290,7 @@ Execution failure 表示工具没有正常产生结果，例如 timeout、except
 
 #### 当前边界
 
-当前项目尚无 RL 实验，不能把研究动机写成结果。
+当前项目尚无有效非零 RL 更新或质量实验，不能把这次 plumbing smoke 写成训练结果。
 
 ### Q17：Fatal-aware masking 想解决什么？
 
@@ -321,11 +321,12 @@ Execution failure 表示工具没有正常产生结果，例如 timeout、except
 
 ## 真实踩坑与待补证据
 
-1. **Commit hash 需要和源码状态一起看**：M0.1 已将 `git_dirty` 与 source-tree hash 写入 artifact manifest，并已从 `a835842` 的 clean checkpoint 重跑 pytest、CLI smoke 和 CLI fault profile。
+1. **Commit hash 需要和源码状态一起看**：M0.1 已将 `git_dirty` 与 source-tree hash 写入 artifact manifest，并已从 clean checkout 重跑 pytest、CLI smoke 和 CLI fault profile；M1-C1 额外记录了后端版本、runtime profile 和真实运行状态。
 2. **Oracle 指标极易被误读**：12 条 synthetic fixture 的满分只验证 plumbing，不是模型能力。
 3. **结构化成功不等于语义成功**：irrelevant result 必须与 timeout 等 execution failure 分开。
 4. **固定 latency 与 wall-clock latency 不同**：真实测量值包含运行抖动，不应当作严格 determinism 证据。
 5. **Credit helper 不等于训练算法**：没有 reward→advantage→loss 的真实链路，就不能使用“实现 CW-GRPO”的表述。
+6. **checkpoint 不等于策略更新**：C0/C1 的 `global_step_1` 只能证明保存路径工作；只有 runtime actor evidence 和非零 LoRA parameter delta 才能声称发生了 policy update。当前固定 C1 group 为零方差，因此状态是 `no_learning_signal`。
 
 ## 一页式复述顺序
 

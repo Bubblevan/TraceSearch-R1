@@ -68,10 +68,26 @@ if (
         _install_c0_post_batch_weight_sync_skip(_verl_backend_module, phase="c0")
 
 if os.environ.get("TRACESEARCH_M1C_OBSERVER_DIR"):
+    # ``VerlBackend`` is constructed inside the Ray ``VerlTaskRunner`` rather
+    # than in the CLI driver.  Install the observer in that process too; the
+    # driver-side install is retained as an idempotent fallback for local
+    # construction and tests.
+    from importlib import import_module as _import_module
+    from tracesearch.training.m1c_observer import (
+        RuntimeTrainingObserver as _RuntimeTrainingObserver,
+        install_training_observer as _install_training_observer,
+    )
+
+    _backend_module = _import_module("rllm.trainer.verl.verl_backend")
+    _backend_observer = _RuntimeTrainingObserver(
+        os.environ["TRACESEARCH_M1C_OBSERVER_DIR"],
+        phase=os.environ.get("TRACESEARCH_M1C_PHASE", "unknown"),
+    )
+    _install_training_observer(_backend_module, _backend_observer)
+
     # The actor worker runs in a Ray child process.  The probe is installed
     # there, where the real FSDP/LoRA tensors live, and writes only runtime
     # evidence back to the run directory.
-    from importlib import import_module as _import_module
     from tracesearch.training.m1c_observer import install_actor_update_probe as _install_actor_update_probe
 
     _install_actor_update_probe(_import_module("verl.workers.engine_workers"))
